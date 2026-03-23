@@ -45,9 +45,8 @@ import sys
 from datetime import datetime, timezone
 
 # ── Production imports ────────────────────────────────────────────────────────
-# import asyncpg
-# from aiokafka import AIOKafkaProducer
-# from aiokafka.errors import KafkaConnectionError
+import asyncpg
+from aiokafka import AIOKafkaProducer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,6 +81,21 @@ TOPIC_MAP = {
     "reconciliation_mismatch": "dvp.reconciliation_mismatch",  # CRITICAL
 }
 DEFAULT_TOPIC = "dvp.events"
+
+
+async def _init_connection(conn):
+    """Configure asyncpg codecs so strings pass through for UUID/timestamp."""
+    for typename in ('uuid', 'timestamptz', 'timestamp', 'date'):
+        await conn.set_type_codec(
+            typename, encoder=str, decoder=str,
+            schema='pg_catalog', format='text',
+        )
+    await conn.set_type_codec(
+        'jsonb',
+        encoder=lambda v: v if isinstance(v, str) else json.dumps(v),
+        decoder=json.loads,
+        schema='pg_catalog', format='text',
+    )
 
 
 def _resolve_topic(event_type: str) -> str:
@@ -364,46 +378,46 @@ async def main():
     logger.info("MAX_RETRIES    = %d", MAX_RETRIES)
     logger.info("")
 
-    # ── Production wiring ────────────────────────────────────────────────────
-    # pool = await asyncpg.create_pool(
-    #     DATABASE_URL,
-    #     min_size=2,
-    #     max_size=10,
-    #     command_timeout=30,
-    # )
-    # kafka_producer = AIOKafkaProducer(
-    #     bootstrap_servers=KAFKA_BROKERS,
-    #     enable_idempotence=True,          # Exactly-once producer semantics
-    #     acks="all",                       # Wait for all ISR replicas
-    #     compression_type="lz4",
-    #     max_batch_size=16384,
-    #     linger_ms=5,
-    # )
-    # await kafka_producer.start()
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Connect to PostgreSQL ─────────────────────────────────────────────────
+    pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=2,
+        max_size=10,
+        command_timeout=30,
+        init=_init_connection,
+    )
+    logger.info("Connected to PostgreSQL")
 
-    logger.info("To run against real infrastructure:")
-    logger.info("  1. Set DATABASE_URL environment variable")
-    logger.info("  2. Set KAFKA_BROKERS environment variable")
-    logger.info("  3. Uncomment asyncpg + aiokafka wiring in main()")
-    logger.info("  4. pip install asyncpg aiokafka")
-    logger.info("  5. python outbox_publisher.py")
-    logger.info("")
-    logger.info("Monitoring queries:")
-    logger.info("  SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL;")
-    logger.info("  SELECT COUNT(*) FROM outbox_events WHERE dlq_at IS NOT NULL;")
-    logger.info("  SELECT event_type, COUNT(*) FROM outbox_events")
-    logger.info("    WHERE published_at IS NULL GROUP BY event_type;")
-    logger.info("")
-    logger.info("Kafka topics consumed by downstream systems:")
-    for suffix, topic in TOPIC_MAP.items():
-        logger.info("  %-40s → %s", suffix, topic)
-    logger.info("  (DLQ) %-37s → dvp.dead_letter_queue", "max_retries exhausted")
-    logger.info("")
+    pending = await pool.fetchval(
+        "SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL"
+    )
+    logger.info("Pending outbox events: %d", pending)
 
-    # Sandbox: would run publisher.run_forever() here
-    # with real pool + producer wired above
-    logger.info("OutboxPublisher ready. Wiring real DB + Kafka to activate.")
+    # ── Connect to Kafka ──────────────────────────────────────────────────────
+    kafka_producer = AIOKafkaProducer(
+        bootstrap_servers=KAFKA_BROKERS,
+        enable_idempotence=True,
+        acks="all",
+        compression_type="lz4",
+        max_batch_size=16384,
+        linger_ms=5,
+    )
+    await kafka_producer.start()
+    logger.info("Connected to Kafka at %s", KAFKA_BROKERS)
+
+    # ── Start publisher ───────────────────────────────────────────────────────
+    publisher = OutboxPublisher(db=pool, kafka_producer=kafka_producer)
+
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(publisher, loop)
+
+    logger.info("OutboxPublisher running — Ctrl+C to stop")
+    try:
+        await publisher.run_forever(poll_interval=POLL_INTERVAL)
+    finally:
+        await kafka_producer.stop()
+        await pool.close()
+        logger.info("Publisher shut down — pool and producer closed.")
 
 
 if __name__ == "__main__":

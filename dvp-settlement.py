@@ -39,9 +39,12 @@ Architecture Overview
 """
  
 import asyncio
+import asyncpg
+import contextlib
 import json
-import uuid
 import logging
+import os
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1951,6 +1954,63 @@ class DVPOutboxPublisher:
  
  
 # ─────────────────────────────────────────────────────────────────────────────
+# AsyncpgDB — Real Database Adapter
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _init_connection(conn):
+    """Configure asyncpg codecs so strings pass through for UUID/timestamp."""
+    for typename in ('uuid', 'timestamptz', 'timestamp', 'date'):
+        await conn.set_type_codec(
+            typename, encoder=str, decoder=str,
+            schema='pg_catalog', format='text',
+        )
+    await conn.set_type_codec(
+        'jsonb',
+        encoder=lambda v: v if isinstance(v, str) else json.dumps(v),
+        decoder=json.loads,
+        schema='pg_catalog', format='text',
+    )
+
+
+class AsyncpgDB(AbstractDB):
+    """
+    Wraps asyncpg pool, implementing AbstractDB.
+    Routes queries through a transaction connection when active.
+    """
+
+    def __init__(self, pool):
+        self._pool = pool
+        self._tx_conn = None
+
+    async def fetchrow(self, query, *args):
+        target = self._tx_conn or self._pool
+        return await target.fetchrow(query, *args)
+
+    async def fetch(self, query, *args):
+        target = self._tx_conn or self._pool
+        return await target.fetch(query, *args)
+
+    async def execute(self, query, *args):
+        target = self._tx_conn or self._pool
+        return await target.execute(query, *args)
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        if self._tx_conn is not None:
+            async with self._tx_conn.transaction():
+                yield
+        else:
+            async with self._pool.acquire() as conn:
+                async with conn.transaction():
+                    self._tx_conn = conn
+                    try:
+                        yield
+                    finally:
+                        self._tx_conn = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sandbox Stubs (for local development / testing only)
 # ─────────────────────────────────────────────────────────────────────────────
  
@@ -2020,62 +2080,143 @@ class SandboxSigningQueue(AbstractSigningQueue):
  
 async def sandbox_demo():
     """
-    Illustrative sandbox walkthrough.
-    In production, wire real asyncpg pool + aiokafka producer.
- 
-    Scenario:
-    ─────────
-    BlackRock (seller) delivers 500,000 shares of Apple Inc. (AAPL)
-    to State Street (buyer), receiving $97,500,000 USD in exchange.
-    Settlement via SWIFT MT543/MT103 with on-chain atomic swap
-    on JPMorgan Onyx permissioned network.
+    Runs the full DVP settlement flow against a real PostgreSQL database.
+    External services (SWIFT, FedWire, CLS, HSM, chain) use sandbox stubs.
+    Outbox events are written to outbox_events for Kafka delivery
+    by the separate outbox-publisher.py process.
+
+    Scenario: BlackRock sells 100,000 AAPL shares to State Street
+    at $195/share = $19,500,000 USD via SWIFT + on-chain atomic swap.
     """
     logger.info("=" * 70)
-    logger.info("DVP Settlement & Clearing System — Sandbox Demo")
-    logger.info("Scenario: BlackRock AAPL → State Street | $97.5M USD")
+    logger.info("DVP Settlement & Clearing System — Live Sandbox Demo")
+    logger.info(
+        "Scenario: BlackRock 100K AAPL → State Street | $19.5M USD"
+    )
     logger.info("=" * 70)
- 
-    # In production:
-    # pool = await asyncpg.create_pool("postgresql://postgres@localhost/dvp_sandbox")
-    # kafka_producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
-    # await kafka_producer.start()
- 
-    # Sandbox stubs
-    compliance_provider = SandboxComplianceProvider()
-    hsm                 = SandboxHSMSigningService()
-    chain               = SandboxChainAdapter()
-    swift               = SandboxSWIFTGateway()
-    fedwire             = SandboxFedWireGateway()
-    cls_gateway         = SandboxCLSGateway()
-    signing_queue       = SandboxSigningQueue()
- 
-    logger.info("All sub-services wired. In sandbox mode — all external calls are stubbed.")
+
+    # ── Connect to PostgreSQL ─────────────────────────────────────────────────────
+    database_url = os.getenv(
+        "DATABASE_URL", "postgresql://postgres@localhost/dvp_sandbox"
+    )
+    pool = await asyncpg.create_pool(
+        database_url, min_size=2, max_size=5, init=_init_connection,
+    )
+    db = AsyncpgDB(pool)
+    logger.info(
+        "Connected to PostgreSQL — %s", database_url.split("@")[-1]
+    )
+
+    # ── Wire services (real DB + sandbox external stubs) ──────────────────
+    compliance_svc = ComplianceScreeningService(
+        db, SandboxComplianceProvider()
+    )
+    chain = SandboxChainAdapter()
+    leg_svc = SettlementLegService(db, chain)
+    escrow_svc = EscrowService(db, chain)
+    hsm = SandboxHSMSigningService()
+    signing_queue = SandboxSigningQueue()
+
+    required_custodians = ["IRVTUS3N", "SBOSUS33", "DTCCUS3N"]
+    multisig_svc = MultiSigApprovalService(db, hsm, required_custodians)
+    swap_executor = AtomicSwapExecutor(db, chain, signing_queue)
+    hybrid_gw = HybridSettlementGateway(
+        db, SandboxSWIFTGateway(), SandboxFedWireGateway(),
+        SandboxCLSGateway(),
+    )
+    recon_engine = DVPReconciliationEngine(db, chain)
+
+    dvp_svc = DVPSettlementService(
+        db=db,
+        compliance_service=compliance_svc,
+        leg_service=leg_svc,
+        escrow_service=escrow_svc,
+        multisig_service=multisig_svc,
+        atomic_swap=swap_executor,
+        hybrid_gateway=hybrid_gw,
+        reconciliation_engine=recon_engine,
+        security_escrow_address="0xSECURITY_ESCROW_CONTRACT",
+        cash_escrow_address="0xCASH_ESCROW_CONTRACT",
+        security_token_address="0xAAPL_TOKEN_CONTRACT",
+        cash_token_address="0xUSD_TOKEN_CONTRACT",
+    )
+    logger.info("All services wired (real DB + sandbox external stubs)")
+
+    # ── Execute full settlement flow ──────────────────────────────────────────
+    try:
+        # Steps 1-6: initiate → compliance → lock legs → escrow → SWIFT
+        instruction = await dvp_svc.initiate_settlement(
+            trade_reference="BLK-SST-AAPL-LIVE-001",
+            isin="US0378331005",
+            security_type=SecurityType.EQUITY,
+            quantity=Decimal("100000"),
+            price_per_unit=Decimal("195.00"),
+            currency="USD",
+            seller_entity_id="549300BNMGNFKN6LAD61",
+            buyer_entity_id="571474TGEMMWANRLN572",
+            seller_wallet="0xBLACKROCK_WALLET_ADDRESS",
+            buyer_wallet="0xSTATESTREET_WALLET_ADDRESS",
+            seller_custodian="IRVTUS3N",
+            buyer_custodian="SBOSUS33",
+            settlement_rail=SettlementRail.SWIFT,
+            intended_settlement_date="2026-03-23",
+            seller_jurisdiction="US",
+            buyer_jurisdiction="US",
+            idempotency_key=str(uuid.uuid4()),
+        )
+        logger.info(
+            "Instruction %s at MULTISIG_PENDING", instruction.id
+        )
+
+        # Step 7: Cast multi-sig votes (2-of-3 quorum)
+        await multisig_svc.cast_vote(
+            instruction.id, "IRVTUS3N",
+            "HSM-BNYM-KEY-001", MultiSigVote.APPROVE,
+        )
+        await multisig_svc.cast_vote(
+            instruction.id, "SBOSUS33",
+            "HSM-SST-KEY-001", MultiSigVote.APPROVE,
+        )
+
+        if await multisig_svc.check_quorum(instruction.id):
+            await multisig_svc.finalize_quorum(instruction.id)
+            logger.info("Multi-sig quorum reached")
+
+        # Steps 8-9: Atomic swap + reconciliation
+        try:
+            swap_tx = await dvp_svc.finalize_settlement(
+                instruction.id
+            )
+            logger.info("Settlement COMPLETE — tx=%s", swap_tx)
+        except ReconciliationHalt:
+            logger.warning(
+                "Reconciliation mismatch (expected in sandbox — "
+                "on-chain balances are stubbed). "
+                "Mismatch event written to outbox."
+            )
+
+    except DVPSettlementError as exc:
+        logger.error("Settlement failed: %s", exc)
+
+    # ── Show outbox events ────────────────────────────────────────────────────
+    events = await db.fetch(
+        "SELECT event_type, created_at, published_at "
+        "FROM outbox_events ORDER BY created_at"
+    )
     logger.info("")
-    logger.info("To run against real infrastructure:")
-    logger.info("  1. Connect asyncpg pool to PostgreSQL")
-    logger.info("  2. Run dvp_settlement.sql to create schema")
-    logger.info("  3. Wire real SWIFT Alliance Gateway / SWIFTNet")
-    logger.info("  4. Wire real FedWire FedLine adapter")
-    logger.info("  5. Wire real CLS CLSNet API")
-    logger.info("  6. Wire real HSM (Thales Luna / AWS CloudHSM / Fireblocks)")
-    logger.info("  7. Wire real chain adapter (web3.py / Canton / Daml)")
-    logger.info("  8. Start DVPOutboxPublisher with real AIOKafkaProducer")
+    logger.info("Outbox events in database (%d total):", len(events))
+    for ev in events:
+        status = "PENDING" if ev["published_at"] is None else "PUBLISHED"
+        logger.info("  %-40s %s", ev["event_type"], status)
     logger.info("")
-    logger.info("Settlement flow:")
-    logger.info("  initiate_settlement()         → INITIATED → COMPLIANCE_CHECK → LEGS_LOCKED")
-    logger.info("                                → ESCROW_FUNDED → MULTISIG_PENDING")
-    logger.info("  multisig_service.cast_vote()  → (per custodian)")
-    logger.info("  multisig_service.finalize()   → MULTISIG_APPROVED")
-    logger.info("  dvp_service.finalize_settlement() → ATOMIC_SWAP → SETTLED")
-    logger.info("  reconciliation_engine.reconcile_instruction() → MATCHED")
-    logger.info("")
-    logger.info("Kafka events emitted:")
-    logger.info("  dvp.initiated | dvp.legs_locked | dvp.escrow_funded")
-    logger.info("  dvp.multisig_vote | dvp.multisig_approved")
-    logger.info("  dvp.atomic_swap_initiated | dvp.settled")
-    logger.info("  dvp.reconciliation_mismatch (CRITICAL — triggers ops paging)")
+    logger.info(
+        "Run: python3 outbox-publisher.py  "
+        "to deliver these events to Kafka"
+    )
     logger.info("=" * 70)
- 
- 
+
+    await pool.close()
+
+
 if __name__ == "__main__":
     asyncio.run(sandbox_demo())
