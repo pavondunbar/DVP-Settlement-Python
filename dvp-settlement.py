@@ -1096,8 +1096,8 @@ class AtomicSwapExecutor:
             )
             await self._db.execute(
                 """
-                INSERT INTO cash_accounts (id, entity_id, currency, available_balance, locked_balance, updated_at)
-                VALUES ($1, $2, $3, $4, 0, $5)
+                INSERT INTO cash_accounts (id, entity_id, currency, balance, available_balance, locked_balance, updated_at)
+                VALUES ($1, $2, $3, $4, $4, 0, $5)
                 ON CONFLICT (entity_id, currency)
                 DO UPDATE SET balance           = cash_accounts.balance           + $4,
                               available_balance = cash_accounts.available_balance + $4,
