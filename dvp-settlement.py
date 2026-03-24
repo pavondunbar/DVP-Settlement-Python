@@ -498,69 +498,134 @@ class SettlementLegService:
         """
         Atomically creates both legs and locks the underlying positions.
         Uses a single DB transaction — either both succeed or neither does.
+
+        Concurrency: SELECT ... FOR UPDATE on metadata tables serializes
+        access. Balances read from derived views. Mutations are
+        append-only INSERTs into security_ledger / cash_ledger.
         """
         security_leg_id = _new_id()
         cash_leg_id     = _new_id()
- 
+
         async with self._db.transaction():
-            # ── Lock seller custody account (prevent concurrent withdrawals) ──
+            # ── Lock seller custody row (concurrency gate) ──
             seller_pos = await self._db.fetchrow(
                 """
-                SELECT id, available_quantity
-                FROM custody_positions
+                SELECT id FROM custody_positions
                 WHERE entity_id = $1 AND isin = $2
                 FOR UPDATE
                 """,
                 instruction.seller_entity_id, instruction.isin,
             )
-            if not seller_pos or Decimal(seller_pos["available_quantity"]) < instruction.quantity:
+            if not seller_pos:
+                raise InsufficientSecuritiesError(
+                    f"Seller {instruction.seller_entity_id} has no "
+                    f"position for {instruction.isin}"
+                )
+
+            # ── Read derived balance ──
+            seller_bal = await self._db.fetchrow(
+                """
+                SELECT available_quantity
+                FROM custody_balances
+                WHERE entity_id = $1 AND isin = $2
+                """,
+                instruction.seller_entity_id, instruction.isin,
+            )
+            available_qty = (
+                Decimal(seller_bal["available_quantity"])
+                if seller_bal else Decimal(0)
+            )
+            if available_qty < instruction.quantity:
                 raise InsufficientSecuritiesError(
                     f"Seller {instruction.seller_entity_id} has insufficient "
                     f"{instruction.isin} — required {instruction.quantity}, "
-                    f"available {seller_pos['available_quantity'] if seller_pos else 0}"
+                    f"available {available_qty}"
                 )
- 
-            # ── Lock buyer cash account ──
+
+            # ── Lock buyer cash row (concurrency gate) ──
             buyer_cash = await self._db.fetchrow(
                 """
-                SELECT id, available_balance
-                FROM cash_accounts
+                SELECT id FROM cash_accounts
                 WHERE entity_id = $1 AND currency = $2
                 FOR UPDATE
                 """,
                 instruction.buyer_entity_id, instruction.currency,
             )
-            if not buyer_cash or Decimal(buyer_cash["available_balance"]) < instruction.settlement_amount:
+            if not buyer_cash:
+                raise InsufficientFundsError(
+                    f"Buyer {instruction.buyer_entity_id} has no "
+                    f"account for {instruction.currency}"
+                )
+
+            # ── Read derived balance ──
+            buyer_bal = await self._db.fetchrow(
+                """
+                SELECT available_balance
+                FROM cash_balances
+                WHERE entity_id = $1 AND currency = $2
+                """,
+                instruction.buyer_entity_id, instruction.currency,
+            )
+            available_cash = (
+                Decimal(buyer_bal["available_balance"])
+                if buyer_bal else Decimal(0)
+            )
+            if available_cash < instruction.settlement_amount:
                 raise InsufficientFundsError(
                     f"Buyer {instruction.buyer_entity_id} has insufficient "
-                    f"{instruction.currency} — required {instruction.settlement_amount}, "
-                    f"available {buyer_cash['available_balance'] if buyer_cash else 0}"
+                    f"{instruction.currency} — required "
+                    f"{instruction.settlement_amount}, "
+                    f"available {available_cash}"
                 )
- 
+
             now = _now()
- 
-            # ── Reserve security position ──
+
+            # ── Append security ledger entries (debit AVAILABLE, credit LOCKED) ──
             await self._db.execute(
                 """
-                UPDATE custody_positions
-                SET available_quantity  = available_quantity  - $1,
-                    locked_quantity     = locked_quantity     + $1,
-                    updated_at          = $2
-                WHERE id = $3
+                INSERT INTO security_ledger
+                    (id, entity_id, isin, pool, amount,
+                     instruction_id, reason)
+                VALUES ($1, $2, $3, 'AVAILABLE', $4, $5, 'LOCK')
                 """,
-                instruction.quantity, now, seller_pos["id"],
+                _new_id(), instruction.seller_entity_id,
+                instruction.isin, -instruction.quantity,
+                instruction.id,
             )
- 
-            # ── Reserve cash balance ──
             await self._db.execute(
                 """
-                UPDATE cash_accounts
-                SET available_balance  = available_balance  - $1,
-                    locked_balance     = locked_balance     + $1,
-                    updated_at         = $2
-                WHERE id = $3
+                INSERT INTO security_ledger
+                    (id, entity_id, isin, pool, amount,
+                     instruction_id, reason)
+                VALUES ($1, $2, $3, 'LOCKED', $4, $5, 'LOCK')
                 """,
-                instruction.settlement_amount, now, buyer_cash["id"],
+                _new_id(), instruction.seller_entity_id,
+                instruction.isin, instruction.quantity,
+                instruction.id,
+            )
+
+            # ── Append cash ledger entries (debit AVAILABLE, credit LOCKED) ──
+            await self._db.execute(
+                """
+                INSERT INTO cash_ledger
+                    (id, entity_id, currency, pool, amount,
+                     instruction_id, reason)
+                VALUES ($1, $2, $3, 'AVAILABLE', $4, $5, 'LOCK')
+                """,
+                _new_id(), instruction.buyer_entity_id,
+                instruction.currency,
+                -instruction.settlement_amount, instruction.id,
+            )
+            await self._db.execute(
+                """
+                INSERT INTO cash_ledger
+                    (id, entity_id, currency, pool, amount,
+                     instruction_id, reason)
+                VALUES ($1, $2, $3, 'LOCKED', $4, $5, 'LOCK')
+                """,
+                _new_id(), instruction.buyer_entity_id,
+                instruction.currency,
+                instruction.settlement_amount, instruction.id,
             )
  
             # ── Insert security leg ──
@@ -568,13 +633,16 @@ class SettlementLegService:
                 """
                 INSERT INTO settlement_legs
                   (id, instruction_id, leg_type, originator_entity_id,
-                   beneficiary_entity_id, amount, currency, status, locked_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                   beneficiary_entity_id, amount, currency)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
                 """,
                 security_leg_id, instruction.id, LegType.SECURITY,
                 instruction.seller_entity_id, instruction.buyer_entity_id,
                 instruction.quantity, instruction.isin,
-                LegStatus.LOCKED, now,
+            )
+            await self._db.execute(
+                "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                _new_id(), security_leg_id, LegStatus.LOCKED,
             )
  
             # ── Insert cash leg ──
@@ -582,19 +650,22 @@ class SettlementLegService:
                 """
                 INSERT INTO settlement_legs
                   (id, instruction_id, leg_type, originator_entity_id,
-                   beneficiary_entity_id, amount, currency, status, locked_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                   beneficiary_entity_id, amount, currency)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
                 """,
                 cash_leg_id, instruction.id, LegType.CASH,
                 instruction.buyer_entity_id, instruction.seller_entity_id,
                 instruction.settlement_amount, instruction.currency,
-                LegStatus.LOCKED, now,
+            )
+            await self._db.execute(
+                "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                _new_id(), cash_leg_id, LegStatus.LOCKED,
             )
  
             # ── Update instruction status ──
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, updated_at = $2 WHERE id = $3",
-                SettlementStatus.LEGS_LOCKED, now, instruction.id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                _new_id(), instruction.id, SettlementStatus.LEGS_LOCKED,
             )
  
             # ── Outbox event (same transaction) ──
@@ -721,41 +792,50 @@ class EscrowService:
                 """
                 INSERT INTO escrow_accounts
                   (id, instruction_id, leg_type, holder_entity_id, amount,
-                   currency, status, escrow_address, on_chain_tx_hash, funded_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                   currency, escrow_address, on_chain_tx_hash)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                 """,
                 sec_escrow_id, instruction.id, LegType.SECURITY,
                 instruction.seller_entity_id, instruction.quantity,
-                instruction.isin, LegStatus.IN_ESCROW,
-                security_escrow_address, sec_tx_hash, funded_at,
+                instruction.isin,
+                security_escrow_address, sec_tx_hash,
+            )
+            await self._db.execute(
+                "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                _new_id(), sec_escrow_id, LegStatus.IN_ESCROW,
             )
  
             await self._db.execute(
                 """
                 INSERT INTO escrow_accounts
                   (id, instruction_id, leg_type, holder_entity_id, amount,
-                   currency, status, escrow_address, on_chain_tx_hash, funded_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                   currency, escrow_address, on_chain_tx_hash)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                 """,
                 cash_escrow_id, instruction.id, LegType.CASH,
                 instruction.buyer_entity_id, instruction.settlement_amount,
-                instruction.currency, LegStatus.IN_ESCROW,
-                cash_escrow_address, cash_tx_hash, funded_at,
+                instruction.currency,
+                cash_escrow_address, cash_tx_hash,
+            )
+            await self._db.execute(
+                "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                _new_id(), cash_escrow_id, LegStatus.IN_ESCROW,
             )
  
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, updated_at = $2 WHERE id = $3",
-                SettlementStatus.ESCROW_FUNDED, funded_at, instruction.id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                _new_id(), instruction.id, SettlementStatus.ESCROW_FUNDED,
             )
  
-            await self._db.execute(
-                """
-                UPDATE settlement_legs
-                SET status = $1, updated_at = $2
-                WHERE instruction_id = $3
-                """,
-                LegStatus.IN_ESCROW, funded_at, instruction.id,
+            legs = await self._db.fetch(
+                "SELECT id FROM settlement_legs WHERE instruction_id = $1",
+                instruction.id,
             )
+            for leg in legs:
+                await self._db.execute(
+                    "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                    _new_id(), leg["id"], LegStatus.IN_ESCROW,
+                )
  
             await self._write_outbox_event(
                 instruction.id, "dvp.escrow_funded",
@@ -794,17 +874,18 @@ class EscrowService:
         """
         now = _now()
         async with self._db.transaction():
-            await self._db.execute(
-                """
-                UPDATE escrow_accounts
-                SET status = $1, released_at = $2
-                WHERE instruction_id = $3
-                """,
-                LegStatus.RELEASED, now, instruction_id,
+            escrows = await self._db.fetch(
+                "SELECT id FROM escrow_accounts WHERE instruction_id = $1",
+                instruction_id,
             )
+            for esc in escrows:
+                await self._db.execute(
+                    "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                    _new_id(), esc["id"], LegStatus.RELEASED,
+                )
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, failure_reason = $2, updated_at = $3 WHERE id = $4",
-                SettlementStatus.REVERSED, reason, now, instruction_id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status, failure_reason) VALUES ($1,$2,$3,$4)",
+                _new_id(), instruction_id, SettlementStatus.REVERSED, reason,
             )
             await self._write_outbox_event(
                 instruction_id, "dvp.escrow_released",
@@ -955,8 +1036,8 @@ class MultiSigApprovalService:
         now = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, updated_at = $2 WHERE id = $3",
-                SettlementStatus.MULTISIG_APPROVED, now, instruction_id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                _new_id(), instruction_id, SettlementStatus.MULTISIG_APPROVED,
             )
             await self._write_outbox_event(
                 instruction_id, "dvp.multisig_approved",
@@ -1019,8 +1100,8 @@ class AtomicSwapExecutor:
         # ── Mark as in-flight BEFORE chain call (enables crash recovery) ──
         async with self._db.transaction():
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, updated_at = $2 WHERE id = $3",
-                SettlementStatus.ATOMIC_SWAP, now, instruction.id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                _new_id(), instruction.id, SettlementStatus.ATOMIC_SWAP,
             )
             await self._write_outbox_event(
                 instruction.id, "dvp.atomic_swap_initiated",
@@ -1051,73 +1132,75 @@ class AtomicSwapExecutor:
         settled_at = _now()
         async with self._db.transaction():
             await self._db.execute(
-                """
-                UPDATE dvp_instructions
-                SET status = $1, swap_tx_hash = $2, settled_at = $3, updated_at = $3
-                WHERE id = $4
-                """,
-                SettlementStatus.SETTLED, swap_tx_hash, settled_at, instruction.id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status, swap_tx_hash) VALUES ($1,$2,$3,$4)",
+                _new_id(), instruction.id, SettlementStatus.SETTLED, swap_tx_hash,
             )
  
-            # Release locks — deduct from originator balances
+            # Debit seller's locked securities
             await self._db.execute(
                 """
-                UPDATE custody_positions
-                SET locked_quantity = locked_quantity - $1,
-                    updated_at      = $2
-                WHERE entity_id = $3 AND isin = $4
+                INSERT INTO security_ledger
+                  (id, entity_id, isin, pool, amount, instruction_id, reason)
+                VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT')
                 """,
-                instruction.quantity, settled_at,
-                instruction.seller_entity_id, instruction.isin,
+                _new_id(), instruction.seller_entity_id, instruction.isin,
+                -instruction.quantity, instruction.id,
             )
+
+            # Debit buyer's locked cash
             await self._db.execute(
                 """
-                UPDATE cash_accounts
-                SET balance         = balance         - $1,
-                    locked_balance  = locked_balance  - $1,
-                    updated_at      = $2
-                WHERE entity_id = $3 AND currency = $4
+                INSERT INTO cash_ledger
+                  (id, entity_id, currency, pool, amount, instruction_id, reason)
+                VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT')
                 """,
-                instruction.settlement_amount, settled_at,
-                instruction.buyer_entity_id, instruction.currency,
+                _new_id(), instruction.buyer_entity_id, instruction.currency,
+                -instruction.settlement_amount, instruction.id,
             )
- 
-            # Credit beneficiary accounts
+
+            # Credit buyer's available securities
             await self._db.execute(
                 """
-                INSERT INTO custody_positions (id, entity_id, isin, available_quantity, locked_quantity, updated_at)
-                VALUES ($1, $2, $3, $4, 0, $5)
-                ON CONFLICT (entity_id, isin)
-                DO UPDATE SET available_quantity = custody_positions.available_quantity + $4,
-                              updated_at = $5
+                INSERT INTO security_ledger
+                  (id, entity_id, isin, pool, amount, instruction_id, reason)
+                VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'DELIVERY_CREDIT')
                 """,
                 _new_id(), instruction.buyer_entity_id, instruction.isin,
-                instruction.quantity, settled_at,
+                instruction.quantity, instruction.id,
             )
+
+            # Credit seller's available cash
             await self._db.execute(
                 """
-                INSERT INTO cash_accounts (id, entity_id, currency, balance, available_balance, locked_balance, updated_at)
-                VALUES ($1, $2, $3, $4, $4, 0, $5)
-                ON CONFLICT (entity_id, currency)
-                DO UPDATE SET balance           = cash_accounts.balance           + $4,
-                              available_balance = cash_accounts.available_balance + $4,
-                              updated_at        = $5
+                INSERT INTO cash_ledger
+                  (id, entity_id, currency, pool, amount, instruction_id, reason)
+                VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'DELIVERY_CREDIT')
                 """,
                 _new_id(), instruction.seller_entity_id, instruction.currency,
-                instruction.settlement_amount, settled_at,
+                instruction.settlement_amount, instruction.id,
             )
  
             # Mark escrow accounts as delivered
-            await self._db.execute(
-                "UPDATE escrow_accounts SET status = $1, released_at = $2 WHERE instruction_id = $3",
-                LegStatus.DELIVERED, settled_at, instruction.id,
+            escrows = await self._db.fetch(
+                "SELECT id FROM escrow_accounts WHERE instruction_id = $1",
+                instruction.id,
             )
+            for esc in escrows:
+                await self._db.execute(
+                    "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                    _new_id(), esc["id"], LegStatus.DELIVERED,
+                )
  
             # Mark settlement legs as delivered
-            await self._db.execute(
-                "UPDATE settlement_legs SET status = $1, delivered_at = $2 WHERE instruction_id = $3",
-                LegStatus.DELIVERED, settled_at, instruction.id,
+            legs = await self._db.fetch(
+                "SELECT id FROM settlement_legs WHERE instruction_id = $1",
+                instruction.id,
             )
+            for leg in legs:
+                await self._db.execute(
+                    "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                    _new_id(), leg["id"], LegStatus.DELIVERED,
+                )
  
             await self._write_outbox_event(
                 instruction.id, "dvp.settled",
@@ -1144,8 +1227,8 @@ class AtomicSwapExecutor:
         now = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, failure_reason = $2, updated_at = $3 WHERE id = $4",
-                SettlementStatus.FAILED, reason, now, instruction_id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status, failure_reason) VALUES ($1,$2,$3,$4)",
+                _new_id(), instruction_id, SettlementStatus.FAILED, reason,
             )
             await self._write_outbox_event(
                 instruction_id, "dvp.swap_failed",
@@ -1333,13 +1416,15 @@ class HybridSettlementGateway:
         await self._db.execute(
             """
             INSERT INTO hybrid_rail_messages
-              (id, instruction_id, rail, message_type, payload,
-               status, submitted_at, rail_reference)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+              (id, instruction_id, rail, message_type, payload, rail_reference)
+            VALUES ($1,$2,$3,$4,$5,$6)
             """,
             msg_id, instruction_id, rail, message_type,
-            json.dumps(payload), HybridRailStatus.SUBMITTED,
-            submitted, rail_reference,
+            json.dumps(payload), rail_reference,
+        )
+        await self._db.execute(
+            "INSERT INTO hybrid_rail_message_events (id, message_id, status) VALUES ($1,$2,$3)",
+            _new_id(), msg_id, HybridRailStatus.SUBMITTED,
         )
         return HybridRailMessage(
             id=msg_id, instruction_id=instruction_id, rail=rail,
@@ -1351,14 +1436,15 @@ class HybridSettlementGateway:
     async def confirm_rail_message(self, rail_reference: str, confirmed_at: Optional[str] = None):
         """Called by external webhook / polling when the payment rail confirms delivery."""
         now = confirmed_at or _now()
-        await self._db.execute(
-            """
-            UPDATE hybrid_rail_messages
-            SET status = $1, confirmed_at = $2
-            WHERE rail_reference = $3
-            """,
-            HybridRailStatus.CONFIRMED, now, rail_reference,
+        msgs = await self._db.fetch(
+            "SELECT id FROM hybrid_rail_messages WHERE rail_reference = $1",
+            rail_reference,
         )
+        for msg in msgs:
+            await self._db.execute(
+                "INSERT INTO hybrid_rail_message_events (id, message_id, status) VALUES ($1,$2,$3)",
+                _new_id(), msg["id"], HybridRailStatus.CONFIRMED,
+            )
         self._log.info("Rail message confirmed — ref=%s at=%s", rail_reference, now)
  
  
@@ -1413,11 +1499,11 @@ class DVPReconciliationEngine:
         )
  
         buyer_ledger = await self._db.fetchrow(
-            "SELECT available_quantity FROM custody_positions WHERE entity_id = $1 AND isin = $2",
+            "SELECT available_quantity FROM custody_balances WHERE entity_id = $1 AND isin = $2",
             instruction.buyer_entity_id, instruction.isin,
         )
         seller_ledger = await self._db.fetchrow(
-            "SELECT available_balance FROM cash_accounts WHERE entity_id = $1 AND currency = $2",
+            "SELECT available_balance FROM cash_balances WHERE entity_id = $1 AND currency = $2",
             instruction.seller_entity_id, instruction.currency,
         )
  
@@ -1445,7 +1531,7 @@ class DVPReconciliationEngine:
         # ── 2. Rail confirmation check ──
         unconfirmed_rails = await self._db.fetch(
             """
-            SELECT id, rail, message_type FROM hybrid_rail_messages
+            SELECT id, rail, message_type FROM hybrid_rail_messages_current
             WHERE instruction_id = $1 AND status != $2
             """,
             instruction.id, HybridRailStatus.CONFIRMED,
@@ -1462,7 +1548,7 @@ class DVPReconciliationEngine:
  
         # ── 3. Escrow account closure check ──
         open_escrows = await self._db.fetch(
-            "SELECT id, leg_type FROM escrow_accounts WHERE instruction_id = $1 AND status NOT IN ($2,$3)",
+            "SELECT id, leg_type FROM escrow_accounts_current WHERE instruction_id = $1 AND status NOT IN ($2,$3)",
             instruction.id, LegStatus.DELIVERED, LegStatus.RELEASED,
         )
         onchain_matched = len(open_escrows) == 0
@@ -1508,8 +1594,8 @@ class DVPReconciliationEngine:
  
             if result == ReconciliationResult.MISMATCH:
                 await self._db.execute(
-                    "UPDATE dvp_instructions SET reconciliation_status = $1 WHERE id = $2",
-                    "SUSPENDED", instruction.id,
+                    "INSERT INTO dvp_instruction_events (id, instruction_id, reconciliation_status) VALUES ($1,$2,$3)",
+                    _new_id(), instruction.id, "SUSPENDED",
                 )
                 await self._db.execute(
                     """
@@ -1632,7 +1718,7 @@ class DVPSettlementService:
         """
         # ── Step 1: Idempotency guard ──
         existing = await self._db.fetchrow(
-            "SELECT id, status FROM dvp_instructions WHERE idempotency_key = $1",
+            "SELECT id, status FROM dvp_instructions_current WHERE idempotency_key = $1",
             idempotency_key,
         )
         if existing:
@@ -1677,9 +1763,9 @@ class DVPSettlementService:
                   (id, trade_reference, isin, security_type, quantity, price_per_unit,
                    settlement_amount, currency, seller_entity_id, buyer_entity_id,
                    seller_wallet, buyer_wallet, seller_custodian, buyer_custodian,
-                   settlement_rail, intended_settlement_date, status,
+                   settlement_rail, intended_settlement_date,
                    idempotency_key, created_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                 """,
                 instruction_id, trade_reference, isin, security_type,
                 quantity, price_per_unit, settlement_amount, currency,
@@ -1687,7 +1773,11 @@ class DVPSettlementService:
                 seller_wallet, buyer_wallet,
                 seller_custodian, buyer_custodian,
                 settlement_rail, intended_settlement_date,
-                SettlementStatus.INITIATED, idempotency_key, now,
+                idempotency_key, now,
+            )
+            await self._db.execute(
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                _new_id(), instruction_id, SettlementStatus.INITIATED,
             )
             await self._db.execute(
                 "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
@@ -1714,8 +1804,8 @@ class DVPSettlementService:
  
         # ── Step 3: Compliance screening (outside DB tx) ──
         await self._db.execute(
-            "UPDATE dvp_instructions SET status = $1, updated_at = $2 WHERE id = $3",
-            SettlementStatus.COMPLIANCE_CHECK, _now(), instruction_id,
+            "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+            _new_id(), instruction_id, SettlementStatus.COMPLIANCE_CHECK,
         )
         compliance = await self._compliance.screen_instruction(
             instruction, seller_jurisdiction, buyer_jurisdiction
@@ -1739,8 +1829,8 @@ class DVPSettlementService:
  
         # ── Multi-sig pending ──
         await self._db.execute(
-            "UPDATE dvp_instructions SET status = $1, updated_at = $2 WHERE id = $3",
-            SettlementStatus.MULTISIG_PENDING, _now(), instruction_id,
+            "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+            _new_id(), instruction_id, SettlementStatus.MULTISIG_PENDING,
         )
  
         self._log.info(
@@ -1757,7 +1847,7 @@ class DVPSettlementService:
         """
         # Reload instruction
         row = await self._db.fetchrow(
-            "SELECT * FROM dvp_instructions WHERE id = $1", instruction_id
+            "SELECT * FROM dvp_instructions_current WHERE id = $1", instruction_id
         )
         if not row:
             raise DVPSettlementError(f"Instruction {instruction_id} not found")
@@ -1784,8 +1874,8 @@ class DVPSettlementService:
         now = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "UPDATE dvp_instructions SET status = $1, failure_reason = $2, updated_at = $3 WHERE id = $4",
-                SettlementStatus.REVERSED, reason, now, instruction_id,
+                "INSERT INTO dvp_instruction_events (id, instruction_id, status, failure_reason) VALUES ($1,$2,$3,$4)",
+                _new_id(), instruction_id, SettlementStatus.REVERSED, reason,
             )
             await self._db.execute(
                 "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
@@ -1868,19 +1958,21 @@ class DVPOutboxPublisher:
     async def _poll_and_publish(self):
         events = await self._db.fetch(
             """
-            SELECT id, aggregate_id, event_type, payload, retry_count
-            FROM outbox_events
-            WHERE published_at IS NULL
-              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-            ORDER BY created_at
+            SELECT oe.id, oe.aggregate_id, oe.event_type, oe.payload
+            FROM outbox_events oe
+            WHERE NOT EXISTS (
+                SELECT 1 FROM outbox_delivery_log dl
+                WHERE dl.event_id = oe.id
+                AND dl.status IN ('PUBLISHED', 'DLQ')
+            )
+            ORDER BY oe.created_at
             LIMIT $1
-            FOR UPDATE SKIP LOCKED
             """,
             self.BATCH_SIZE,
         )
         if not events:
             return
- 
+
         for event in events:
             await self._deliver(event)
  
@@ -1888,8 +1980,7 @@ class DVPOutboxPublisher:
         event_id   = event["id"]
         event_type = event["event_type"]
         payload    = event["payload"] if isinstance(event["payload"], dict) else json.loads(event["payload"])
-        retries    = event.get("retry_count", 0)
- 
+
         kafka_message = json.dumps({
             "event_id": event_id,
             "event_type": event_type,
@@ -1897,7 +1988,7 @@ class DVPOutboxPublisher:
             "payload": payload,
             "published_at": _now(),
         }).encode()
- 
+
         try:
             await self._kafka.send_and_wait(
                 topic=f"dvp.{event_type.split('.', 1)[-1]}",
@@ -1905,12 +1996,17 @@ class DVPOutboxPublisher:
                 key=event["aggregate_id"].encode(),
             )
             await self._db.execute(
-                "UPDATE outbox_events SET published_at = $1 WHERE id = $2",
-                _now(), event_id,
+                "INSERT INTO outbox_delivery_log (id, event_id, status) VALUES ($1,$2,'PUBLISHED')",
+                _new_id(), event_id,
             )
             self._log.debug("Published event %s type=%s", event_id, event_type)
- 
+
         except Exception as exc:
+            retry_row = await self._db.fetchrow(
+                "SELECT COUNT(*) AS cnt FROM outbox_delivery_log WHERE event_id = $1 AND status = 'RETRY'",
+                event_id,
+            )
+            retries = retry_row["cnt"] if retry_row else 0
             self._log.warning(
                 "Failed to publish event %s (attempt %d): %s",
                 event_id, retries + 1, exc
@@ -1918,17 +2014,9 @@ class DVPOutboxPublisher:
             if retries + 1 >= self.MAX_RETRIES:
                 await self._send_to_dlq(event_id, event_type, payload, str(exc))
             else:
-                # Exponential backoff: 5s, 25s, 125s
-                next_retry_seconds = 5 ** (retries + 1)
                 await self._db.execute(
-                    """
-                    UPDATE outbox_events
-                    SET retry_count = retry_count + 1,
-                        next_retry_at = NOW() + ($1 * INTERVAL '1 second'),
-                        last_error = $2
-                    WHERE id = $3
-                    """,
-                    next_retry_seconds, str(exc), event_id,
+                    "INSERT INTO outbox_delivery_log (id, event_id, status, error) VALUES ($1,$2,'RETRY',$3)",
+                    _new_id(), event_id, str(exc),
                 )
  
     async def _send_to_dlq(self, event_id: str, event_type: str, payload: dict, error: str):
@@ -1944,8 +2032,8 @@ class DVPOutboxPublisher:
         except Exception:
             pass
         await self._db.execute(
-            "UPDATE outbox_events SET published_at = $1, dlq_at = $1 WHERE id = $2",
-            _now(), event_id,
+            "INSERT INTO outbox_delivery_log (id, event_id, status, error) VALUES ($1,$2,'DLQ',$3)",
+            _new_id(), event_id, error,
         )
         self._log.error(
             "Event %s (type=%s) sent to DLQ after %d attempts — error: %s",

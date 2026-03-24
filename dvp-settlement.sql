@@ -4,12 +4,21 @@
 -- ║                                                                        ║
 -- ║  ⚠️  SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION               ║
 -- ║                                                                        ║
+-- ║  Architecture: FULLY APPEND-ONLY with event-sourced state machines.    ║
+-- ║  Every table is INSERT-only — UPDATE and DELETE are prohibited at       ║
+-- ║  the database level via BEFORE triggers.                               ║
+-- ║                                                                        ║
+-- ║  Financial mutations: Double-entry via security_ledger / cash_ledger.  ║
+-- ║  Balances: Derived from ledger sums (custody_balances, cash_balances). ║
+-- ║  State machines: Event log tables + current-state views.               ║
+-- ║                                                                        ║
 -- ║  Scenario: BlackRock (seller) delivers 500,000 shares of               ║
--- ║  Apple Inc. (AAPL) to State Street (buyer) for $97,500,000 USD         ║
+-- ║  Apple Inc. (AAPL) to State Street (buyer) for $97,500,000 USD        ║
 -- ║  via SWIFT MT543 / on-chain atomic swap.                               ║
 -- ║                                                                        ║
 -- ║  Modeled on: JPMorgan Onyx, DTCC Project Ion, CLS                     ║
 -- ╚══════════════════════════════════════════════════════════════════════════╝
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Extensions
@@ -23,186 +32,415 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";   -- uuid_generate_v4()
 -- Drop (for sandbox re-runs)
 -- ─────────────────────────────────────────────────────────────────────────────
 
-DROP TABLE IF EXISTS reconciliation_reports  CASCADE;
-DROP TABLE IF EXISTS hybrid_rail_messages    CASCADE;
-DROP TABLE IF EXISTS multisig_approvals      CASCADE;
-DROP TABLE IF EXISTS escrow_accounts         CASCADE;
-DROP TABLE IF EXISTS settlement_legs         CASCADE;
-DROP TABLE IF EXISTS compliance_screenings   CASCADE;
-DROP TABLE IF EXISTS outbox_events           CASCADE;
-DROP TABLE IF EXISTS dvp_instructions        CASCADE;
-DROP TABLE IF EXISTS cash_accounts           CASCADE;
-DROP TABLE IF EXISTS custody_positions       CASCADE;
-DROP TABLE IF EXISTS registered_entities     CASCADE;
+DROP VIEW  IF EXISTS outbox_events_current          CASCADE;
+DROP VIEW  IF EXISTS hybrid_rail_messages_current    CASCADE;
+DROP VIEW  IF EXISTS escrow_accounts_current         CASCADE;
+DROP VIEW  IF EXISTS settlement_legs_current         CASCADE;
+DROP VIEW  IF EXISTS dvp_instructions_current        CASCADE;
+DROP VIEW  IF EXISTS cash_balances                   CASCADE;
+DROP VIEW  IF EXISTS custody_balances                CASCADE;
+DROP TABLE IF EXISTS outbox_delivery_log             CASCADE;
+DROP TABLE IF EXISTS reconciliation_reports          CASCADE;
+DROP TABLE IF EXISTS hybrid_rail_message_events      CASCADE;
+DROP TABLE IF EXISTS hybrid_rail_messages            CASCADE;
+DROP TABLE IF EXISTS multisig_approvals              CASCADE;
+DROP TABLE IF EXISTS escrow_account_events           CASCADE;
+DROP TABLE IF EXISTS escrow_accounts                 CASCADE;
+DROP TABLE IF EXISTS settlement_leg_events           CASCADE;
+DROP TABLE IF EXISTS settlement_legs                 CASCADE;
+DROP TABLE IF EXISTS compliance_screenings           CASCADE;
+DROP TABLE IF EXISTS dvp_instruction_events          CASCADE;
+DROP TABLE IF EXISTS outbox_events                   CASCADE;
+DROP TABLE IF EXISTS dvp_instructions                CASCADE;
+DROP TABLE IF EXISTS cash_ledger                     CASCADE;
+DROP TABLE IF EXISTS security_ledger                 CASCADE;
+DROP TABLE IF EXISTS cash_accounts                   CASCADE;
+DROP TABLE IF EXISTS custody_positions               CASCADE;
+DROP TABLE IF EXISTS registered_entities             CASCADE;
+
+DROP FUNCTION IF EXISTS deny_mutation()              CASCADE;
+DROP FUNCTION IF EXISTS check_security_balance()     CASCADE;
+DROP FUNCTION IF EXISTS check_cash_balance()         CASCADE;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- IMMUTABILITY ENFORCEMENT
+-- Every table is append-only. UPDATE and DELETE are prohibited.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE FUNCTION deny_mutation() RETURNS TRIGGER AS $$
+BEGIN
+    RAISE EXCEPTION 'Append-only: % on table "%" is prohibited',
+        TG_OP, TG_TABLE_NAME;
+END;
+$$ LANGUAGE plpgsql;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 1. registered_entities
---    Institutional participants — LEI-identified.
---    Mirrors GLEIF global entity registry.
+--    Institutional participants — LEI-identified. Immutable.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE registered_entities (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     entity_name         VARCHAR(256)    NOT NULL,
-    lei                 VARCHAR(20)     NOT NULL UNIQUE,  -- ISO 17442 LEI
-    entity_type         VARCHAR(50)     NOT NULL,         -- ASSET_MANAGER | CUSTODIAN | PRIME_BROKER | BANK | CCP | CSD
+    lei                 VARCHAR(20)     NOT NULL UNIQUE,
+    entity_type         VARCHAR(50)     NOT NULL,
     jurisdiction        VARCHAR(100)    NOT NULL,
-    regulator           VARCHAR(100),                     -- SEC | FCA | BaFin | MAS
-    bic                 VARCHAR(11),                      -- SWIFT BIC
+    regulator           VARCHAR(100),
+    bic                 VARCHAR(11),
     is_active           BOOLEAN         NOT NULL DEFAULT TRUE,
-    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
 COMMENT ON TABLE registered_entities IS
-  'Institutional counterparty registry — LEI-identified. '
-  'All DVP participants must appear here before any instruction can be created.';
+  'Institutional counterparty registry — LEI-identified. Immutable.';
+
+CREATE TRIGGER trg_deny_update_registered_entities
+    BEFORE UPDATE ON registered_entities FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_registered_entities
+    BEFORE DELETE ON registered_entities FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 2. custody_positions
---    Tokenized security positions held per entity per ISIN.
---    Two-column balance model: available + locked (prevents double-delivery).
+--    Registration table for tokenized security positions. Immutable metadata.
+--    Balances derived from security_ledger via custody_balances view.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE custody_positions (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    entity_id            VARCHAR(100)     NOT NULL,    -- References LEI
-    isin                 VARCHAR(12)      NOT NULL,    -- ISO 6166
-    cusip                VARCHAR(9),                   -- US securities identifier
-    sedol                VARCHAR(7),                   -- UK/international
+    entity_id            VARCHAR(100)     NOT NULL,
+    isin                 VARCHAR(12)      NOT NULL,
+    cusip                VARCHAR(9),
+    sedol                VARCHAR(7),
     security_description VARCHAR(256),
-    available_quantity   DECIMAL(38,10)   NOT NULL DEFAULT 0,
-    locked_quantity      DECIMAL(38,10)   NOT NULL DEFAULT 0,
-    token_address        VARCHAR(256),                 -- ERC-1400 / ERC-3643 contract
-    wallet_address       VARCHAR(256),                 -- DLT wallet
-    custodian            VARCHAR(100),                 -- DTC | Euroclear | Clearstream
-    updated_at           TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
+    token_address        VARCHAR(256),
+    wallet_address       VARCHAR(256),
+    custodian            VARCHAR(100),
+    created_at           TIMESTAMPTZ      NOT NULL DEFAULT NOW(),
 
-    UNIQUE (entity_id, isin),
-    CONSTRAINT chk_available_qty  CHECK (available_quantity >= 0),
-    CONSTRAINT chk_locked_qty     CHECK (locked_quantity    >= 0)
+    UNIQUE (entity_id, isin)
 );
 
 COMMENT ON TABLE custody_positions IS
-  'Two-field security ledger per (entity, ISIN). '
-  'available_quantity = free to deliver. locked_quantity = reserved for pending DVP legs. '
-  'SELECT … FOR UPDATE is used before every delivery reservation.';
+  'Registration table per (entity, ISIN). Immutable metadata — no balance columns. '
+  'Balances derived from security_ledger via custody_balances view.';
 
 CREATE INDEX idx_custody_entity_isin ON custody_positions (entity_id, isin);
+
+CREATE TRIGGER trg_deny_update_custody_positions
+    BEFORE UPDATE ON custody_positions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_custody_positions
+    BEFORE DELETE ON custody_positions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 3. cash_accounts
---    Cash/tokenized-cash/CBDC accounts per entity per currency.
---    Two-column balance model mirrors custody_positions.
+--    Registration table for cash/tokenized-cash accounts. Immutable metadata.
+--    Balances derived from cash_ledger via cash_balances view.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE cash_accounts (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    entity_id           VARCHAR(100)    NOT NULL,    -- References LEI
-    currency            VARCHAR(10)     NOT NULL,    -- ISO 4217 or token ticker
-    balance             DECIMAL(38,2)   NOT NULL DEFAULT 0,
-    available_balance   DECIMAL(38,2)   NOT NULL DEFAULT 0,
-    locked_balance      DECIMAL(38,2)   NOT NULL DEFAULT 0,
-    account_type        VARCHAR(50)     NOT NULL DEFAULT 'TOKENIZED_CASH',  -- FIAT | TOKENIZED_CASH | CBDC | STABLECOIN
-    bank_aba            VARCHAR(9),                  -- FedWire routing number
+    entity_id           VARCHAR(100)    NOT NULL,
+    currency            VARCHAR(10)     NOT NULL,
+    account_type        VARCHAR(50)     NOT NULL DEFAULT 'TOKENIZED_CASH',
+    bank_aba            VARCHAR(9),
     swift_bic           VARCHAR(11),
     account_number      VARCHAR(50),
-    updated_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
-    UNIQUE (entity_id, currency),
-    CONSTRAINT chk_balance          CHECK (balance          >= 0),
-    CONSTRAINT chk_available_balance CHECK (available_balance >= 0),
-    CONSTRAINT chk_locked_balance   CHECK (locked_balance   >= 0),
-    CONSTRAINT chk_balance_coherence
-        CHECK (available_balance + locked_balance <= balance + 0.01)  -- tolerance for rounding
+    UNIQUE (entity_id, currency)
 );
 
 COMMENT ON TABLE cash_accounts IS
-  'Three-field cash ledger per (entity, currency). '
-  'available_balance = free to pay. locked_balance = reserved for pending DVP cash legs. '
-  'SELECT … FOR UPDATE is used before every payment reservation.';
+  'Registration table per (entity, currency). Immutable metadata — no balance columns. '
+  'Balances derived from cash_ledger via cash_balances view.';
 
 CREATE INDEX idx_cash_entity_currency ON cash_accounts (entity_id, currency);
+
+CREATE TRIGGER trg_deny_update_cash_accounts
+    BEFORE UPDATE ON cash_accounts FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_cash_accounts
+    BEFORE DELETE ON cash_accounts FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3a. security_ledger (append-only)
+--     Every security balance change is an immutable entry.
+--     Signed amounts: +credit, -debit.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE security_ledger (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id       VARCHAR(100)    NOT NULL,
+    isin            VARCHAR(12)     NOT NULL,
+    pool            VARCHAR(10)     NOT NULL,
+    amount          DECIMAL(38,10)  NOT NULL,
+    instruction_id  UUID,
+    reason          VARCHAR(50)     NOT NULL,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_sec_pool CHECK (pool IN ('AVAILABLE','LOCKED'))
+);
+
+COMMENT ON TABLE security_ledger IS
+  'Append-only ledger for security position changes. Every lock, unlock, '
+  'delivery, and credit is an immutable entry with signed amount. '
+  'Current balances derived by summing entries per (entity_id, isin, pool).';
+
+CREATE INDEX idx_sec_ledger_entity_isin ON security_ledger (entity_id, isin);
+CREATE INDEX idx_sec_ledger_instruction ON security_ledger (instruction_id);
+
+CREATE TRIGGER trg_deny_update_security_ledger
+    BEFORE UPDATE ON security_ledger FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_security_ledger
+    BEFORE DELETE ON security_ledger FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3b. cash_ledger (append-only)
+--     Every cash balance change is an immutable entry.
+--     Signed amounts: +credit, -debit.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE cash_ledger (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id       VARCHAR(100)    NOT NULL,
+    currency        VARCHAR(10)     NOT NULL,
+    pool            VARCHAR(10)     NOT NULL,
+    amount          DECIMAL(38,2)   NOT NULL,
+    instruction_id  UUID,
+    reason          VARCHAR(50)     NOT NULL,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_cash_pool CHECK (pool IN ('AVAILABLE','LOCKED'))
+);
+
+COMMENT ON TABLE cash_ledger IS
+  'Append-only ledger for cash balance changes. Every lock, unlock, '
+  'payment, and credit is an immutable entry with signed amount. '
+  'Current balances derived by summing entries per (entity_id, currency, pool).';
+
+CREATE INDEX idx_cash_ledger_entity_currency ON cash_ledger (entity_id, currency);
+CREATE INDEX idx_cash_ledger_instruction ON cash_ledger (instruction_id);
+
+CREATE TRIGGER trg_deny_update_cash_ledger
+    BEFORE UPDATE ON cash_ledger FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_cash_ledger
+    BEFORE DELETE ON cash_ledger FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3c. custody_balances (derived view)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW custody_balances AS
+SELECT entity_id, isin,
+    COALESCE(SUM(amount) FILTER (WHERE pool = 'AVAILABLE'), 0) AS available_quantity,
+    COALESCE(SUM(amount) FILTER (WHERE pool = 'LOCKED'), 0)    AS locked_quantity
+FROM security_ledger
+GROUP BY entity_id, isin;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3d. cash_balances (derived view)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW cash_balances AS
+SELECT entity_id, currency,
+    COALESCE(SUM(amount), 0)                                     AS balance,
+    COALESCE(SUM(amount) FILTER (WHERE pool = 'AVAILABLE'), 0)   AS available_balance,
+    COALESCE(SUM(amount) FILTER (WHERE pool = 'LOCKED'), 0)      AS locked_balance
+FROM cash_ledger
+GROUP BY entity_id, currency;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 3e. Non-negative balance triggers
+--     AFTER INSERT triggers that validate derived balances >= 0.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION check_security_balance() RETURNS TRIGGER AS $$
+DECLARE
+    derived_balance DECIMAL(38,10);
+BEGIN
+    SELECT COALESCE(SUM(amount), 0) INTO derived_balance
+    FROM security_ledger
+    WHERE entity_id = NEW.entity_id
+      AND isin = NEW.isin
+      AND pool = NEW.pool;
+
+    IF derived_balance < 0 THEN
+        RAISE EXCEPTION 'Negative security balance: entity=%, isin=%, pool=%, balance=%',
+            NEW.entity_id, NEW.isin, NEW.pool, derived_balance;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_check_security_balance
+    AFTER INSERT ON security_ledger
+    FOR EACH ROW EXECUTE FUNCTION check_security_balance();
+
+
+CREATE OR REPLACE FUNCTION check_cash_balance() RETURNS TRIGGER AS $$
+DECLARE
+    derived_balance DECIMAL(38,2);
+BEGIN
+    SELECT COALESCE(SUM(amount), 0) INTO derived_balance
+    FROM cash_ledger
+    WHERE entity_id = NEW.entity_id
+      AND currency = NEW.currency
+      AND pool = NEW.pool;
+
+    IF derived_balance < 0 THEN
+        RAISE EXCEPTION 'Negative cash balance: entity=%, currency=%, pool=%, balance=%',
+            NEW.entity_id, NEW.currency, NEW.pool, derived_balance;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_check_cash_balance
+    AFTER INSERT ON cash_ledger
+    FOR EACH ROW EXECUTE FUNCTION check_cash_balance();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 4. dvp_instructions
---    Root record for each DVP settlement instruction.
---    State machine: INITIATED → … → SETTLED | FAILED | REVERSED
+--    Immutable creation record for each DVP settlement instruction.
+--    State machine transitions stored in dvp_instruction_events.
+--    Current state derived via dvp_instructions_current view.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE dvp_instructions (
     id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    trade_reference          VARCHAR(256)    NOT NULL,    -- CUSIPxTrade or LEI-based
+    trade_reference          VARCHAR(256)    NOT NULL,
     isin                     VARCHAR(12)     NOT NULL,
-    security_type            VARCHAR(50)     NOT NULL,    -- EQUITY | CORPORATE_BOND | GOV_BOND | MBS | REPO | TOKENIZED_FUND
+    security_type            VARCHAR(50)     NOT NULL,
     quantity                 DECIMAL(38,10)  NOT NULL,
     price_per_unit           DECIMAL(38,10)  NOT NULL,
-    settlement_amount        DECIMAL(38,2)   NOT NULL,    -- quantity × price_per_unit
+    settlement_amount        DECIMAL(38,2)   NOT NULL,
     currency                 VARCHAR(10)     NOT NULL,
-
-    -- Counterparty identities (LEI-based)
     seller_entity_id         VARCHAR(100)    NOT NULL,
     buyer_entity_id          VARCHAR(100)    NOT NULL,
-
-    -- On-chain wallet addresses
     seller_wallet            VARCHAR(256)    NOT NULL,
     buyer_wallet             VARCHAR(256)    NOT NULL,
-
-    -- Custodian identities (SWIFT BIC)
     seller_custodian         VARCHAR(11)     NOT NULL,
     buyer_custodian          VARCHAR(11)     NOT NULL,
-
-    -- Settlement routing
-    settlement_rail          VARCHAR(20)     NOT NULL,    -- SWIFT | FEDWIRE | CLS | ONCHAIN | INTERNAL
+    settlement_rail          VARCHAR(20)     NOT NULL,
     intended_settlement_date DATE            NOT NULL,
-
-    -- State machine
-    status                   VARCHAR(30)     NOT NULL DEFAULT 'INITIATED',
-    reconciliation_status    VARCHAR(20),                  -- MATCHED | SUSPENDED
-
-    -- Settlement finality
-    swap_tx_hash             VARCHAR(256),                 -- On-chain atomic swap tx
-    settled_at               TIMESTAMPTZ,
-
-    -- Failure tracking
-    failure_reason           TEXT,
-
-    -- Idempotency
     idempotency_key          VARCHAR(256)    NOT NULL UNIQUE,
-
     created_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    updated_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_quantity          CHECK (quantity          > 0),
     CONSTRAINT chk_price_per_unit    CHECK (price_per_unit    > 0),
-    CONSTRAINT chk_settlement_amount CHECK (settlement_amount > 0),
-    CONSTRAINT chk_status CHECK (status IN (
-        'INITIATED', 'COMPLIANCE_CHECK', 'LEGS_LOCKED', 'ESCROW_FUNDED',
-        'MULTISIG_PENDING', 'MULTISIG_APPROVED', 'ATOMIC_SWAP',
-        'SETTLED', 'FAILED', 'REVERSED'
-    ))
+    CONSTRAINT chk_settlement_amount CHECK (settlement_amount > 0)
 );
 
 COMMENT ON TABLE dvp_instructions IS
-  'Root record for each DVP settlement instruction. '
-  'One row per bilateral trade. State machine enforces strict sequencing. '
-  'swap_tx_hash is the on-chain atomic swap transaction — irrevocable once set.';
+  'Immutable creation record for each DVP settlement instruction. '
+  'All state transitions stored in dvp_instruction_events. '
+  'Query dvp_instructions_current view for current state.';
 
-CREATE INDEX idx_dvp_status          ON dvp_instructions (status);
 CREATE INDEX idx_dvp_isin            ON dvp_instructions (isin);
 CREATE INDEX idx_dvp_seller          ON dvp_instructions (seller_entity_id);
 CREATE INDEX idx_dvp_buyer           ON dvp_instructions (buyer_entity_id);
 CREATE INDEX idx_dvp_settlement_date ON dvp_instructions (intended_settlement_date);
 CREATE INDEX idx_dvp_trade_ref       ON dvp_instructions (trade_reference);
 
+CREATE TRIGGER trg_deny_update_dvp_instructions
+    BEFORE UPDATE ON dvp_instructions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_dvp_instructions
+    BEFORE DELETE ON dvp_instructions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 5. compliance_screenings
---    OFAC / sanctions / PEP screening results per instruction.
+-- 4a. dvp_instruction_events (append-only state transitions)
+--     Each row records a state transition or field update.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE dvp_instruction_events (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    instruction_id        UUID            NOT NULL REFERENCES dvp_instructions(id),
+    status                VARCHAR(30),
+    swap_tx_hash          VARCHAR(256),
+    failure_reason        TEXT,
+    reconciliation_status VARCHAR(20),
+    created_at            TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_event_status CHECK (
+        status IS NULL OR status IN (
+            'INITIATED', 'COMPLIANCE_CHECK', 'LEGS_LOCKED', 'ESCROW_FUNDED',
+            'MULTISIG_PENDING', 'MULTISIG_APPROVED', 'ATOMIC_SWAP',
+            'SETTLED', 'FAILED', 'REVERSED'
+        )
+    ),
+    CONSTRAINT chk_event_recon CHECK (
+        reconciliation_status IS NULL OR reconciliation_status IN ('MATCHED', 'SUSPENDED')
+    ),
+    CONSTRAINT chk_event_has_content CHECK (
+        status IS NOT NULL OR swap_tx_hash IS NOT NULL OR
+        failure_reason IS NOT NULL OR reconciliation_status IS NOT NULL
+    )
+);
+
+COMMENT ON TABLE dvp_instruction_events IS
+  'Append-only event log for DVP instruction state transitions. '
+  'Each row is an immutable record of a status change or field update. '
+  'Current state derived via dvp_instructions_current view.';
+
+CREATE INDEX idx_dvp_events_instruction ON dvp_instruction_events (instruction_id, created_at);
+CREATE INDEX idx_dvp_events_status      ON dvp_instruction_events (status) WHERE status IS NOT NULL;
+
+CREATE TRIGGER trg_deny_update_dvp_instruction_events
+    BEFORE UPDATE ON dvp_instruction_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_dvp_instruction_events
+    BEFORE DELETE ON dvp_instruction_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 4b. dvp_instructions_current (derived view)
+--     Presents the same shape as the original mutable dvp_instructions table.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW dvp_instructions_current AS
+SELECT
+    d.id, d.trade_reference, d.isin, d.security_type,
+    d.quantity, d.price_per_unit, d.settlement_amount, d.currency,
+    d.seller_entity_id, d.buyer_entity_id,
+    d.seller_wallet, d.buyer_wallet,
+    d.seller_custodian, d.buyer_custodian,
+    d.settlement_rail, d.intended_settlement_date,
+    d.idempotency_key, d.created_at,
+    agg.status,
+    agg.updated_at,
+    agg.swap_tx_hash,
+    agg.settled_at,
+    agg.failure_reason,
+    agg.reconciliation_status
+FROM dvp_instructions d
+LEFT JOIN LATERAL (
+    SELECT
+        (array_agg(e.status ORDER BY e.created_at DESC)
+            FILTER (WHERE e.status IS NOT NULL))[1]              AS status,
+        MAX(e.created_at)                                        AS updated_at,
+        (array_agg(e.swap_tx_hash ORDER BY e.created_at DESC)
+            FILTER (WHERE e.swap_tx_hash IS NOT NULL))[1]        AS swap_tx_hash,
+        MIN(e.created_at) FILTER (WHERE e.status = 'SETTLED')   AS settled_at,
+        (array_agg(e.failure_reason ORDER BY e.created_at DESC)
+            FILTER (WHERE e.failure_reason IS NOT NULL))[1]      AS failure_reason,
+        (array_agg(e.reconciliation_status ORDER BY e.created_at DESC)
+            FILTER (WHERE e.reconciliation_status IS NOT NULL))[1] AS reconciliation_status
+    FROM dvp_instruction_events e
+    WHERE e.instruction_id = d.id
+) agg ON TRUE;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 5. compliance_screenings (already append-only)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE compliance_screenings (
@@ -212,187 +450,381 @@ CREATE TABLE compliance_screenings (
     buyer_entity_id      VARCHAR(100)    NOT NULL,
     is_cleared           BOOLEAN         NOT NULL,
     reason               TEXT            NOT NULL,
-    screening_reference  VARCHAR(256)    NOT NULL,    -- Reference from compliance provider
+    screening_reference  VARCHAR(256)    NOT NULL,
     screened_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
-
-COMMENT ON TABLE compliance_screenings IS
-  'OFAC/EU/UN sanctions + PEP screening result per DVP instruction. '
-  'Both counterparties screened in parallel outside the DB transaction. '
-  'Production: ComplyAdvantage, Fircosoft Compliance Link, or direct OFAC API.';
 
 CREATE INDEX idx_screening_instruction ON compliance_screenings (instruction_id);
 CREATE INDEX idx_screening_cleared     ON compliance_screenings (is_cleared);
 
+CREATE TRIGGER trg_deny_update_compliance_screenings
+    BEFORE UPDATE ON compliance_screenings FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_compliance_screenings
+    BEFORE DELETE ON compliance_screenings FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 6. settlement_legs
---    Individual security/cash legs of a DVP instruction.
+--    Immutable creation record for each settlement leg.
+--    Status transitions stored in settlement_leg_events.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE settlement_legs (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instruction_id          UUID            NOT NULL REFERENCES dvp_instructions(id),
-    leg_type                VARCHAR(20)     NOT NULL,    -- SECURITY | CASH
+    leg_type                VARCHAR(20)     NOT NULL,
     originator_entity_id    VARCHAR(100)    NOT NULL,
     beneficiary_entity_id   VARCHAR(100)    NOT NULL,
     amount                  DECIMAL(38,10)  NOT NULL,
-    currency                VARCHAR(20)     NOT NULL,    -- ISIN (security) or ISO 4217 (cash)
-    status                  VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
-    locked_at               TIMESTAMPTZ,
-    delivered_at            TIMESTAMPTZ,
-    failure_reason          TEXT,
-    updated_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    currency                VARCHAR(20)     NOT NULL,
+    created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT chk_leg_type CHECK (leg_type IN ('SECURITY', 'CASH')),
-    CONSTRAINT chk_leg_status CHECK (status IN ('PENDING','LOCKED','IN_ESCROW','DELIVERED','RELEASED','FAILED'))
+    CONSTRAINT chk_leg_type CHECK (leg_type IN ('SECURITY', 'CASH'))
 );
 
 COMMENT ON TABLE settlement_legs IS
-  'Security and cash legs of each DVP instruction. '
-  'Both legs must reach IN_ESCROW before atomic swap executes. '
-  'Pessimistic lock on custody_positions / cash_accounts prevents double-reservation.';
+  'Immutable creation record for settlement legs. '
+  'Status transitions stored in settlement_leg_events. '
+  'Query settlement_legs_current view for current state.';
 
 CREATE INDEX idx_legs_instruction ON settlement_legs (instruction_id);
-CREATE INDEX idx_legs_type_status ON settlement_legs (leg_type, status);
+
+CREATE TRIGGER trg_deny_update_settlement_legs
+    BEFORE UPDATE ON settlement_legs FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_settlement_legs
+    BEFORE DELETE ON settlement_legs FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 6a. settlement_leg_events (append-only state transitions)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE settlement_leg_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    leg_id          UUID            NOT NULL REFERENCES settlement_legs(id),
+    status          VARCHAR(20)     NOT NULL,
+    failure_reason  TEXT,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_leg_event_status CHECK (
+        status IN ('PENDING','LOCKED','IN_ESCROW','DELIVERED','RELEASED','FAILED')
+    )
+);
+
+CREATE INDEX idx_leg_events_leg ON settlement_leg_events (leg_id, created_at);
+
+CREATE TRIGGER trg_deny_update_settlement_leg_events
+    BEFORE UPDATE ON settlement_leg_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_settlement_leg_events
+    BEFORE DELETE ON settlement_leg_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 6b. settlement_legs_current (derived view)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW settlement_legs_current AS
+SELECT
+    sl.id, sl.instruction_id, sl.leg_type,
+    sl.originator_entity_id, sl.beneficiary_entity_id,
+    sl.amount, sl.currency, sl.created_at,
+    COALESCE(agg.status, 'PENDING')  AS status,
+    agg.updated_at,
+    agg.locked_at,
+    agg.delivered_at,
+    agg.failure_reason
+FROM settlement_legs sl
+LEFT JOIN LATERAL (
+    SELECT
+        (array_agg(e.status ORDER BY e.created_at DESC))[1]        AS status,
+        MAX(e.created_at)                                          AS updated_at,
+        MIN(e.created_at) FILTER (WHERE e.status = 'LOCKED')      AS locked_at,
+        MIN(e.created_at) FILTER (WHERE e.status = 'DELIVERED')   AS delivered_at,
+        (array_agg(e.failure_reason ORDER BY e.created_at DESC)
+            FILTER (WHERE e.failure_reason IS NOT NULL))[1]        AS failure_reason
+    FROM settlement_leg_events e
+    WHERE e.leg_id = sl.id
+) agg ON TRUE;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 7. escrow_accounts
---    Dual on-chain escrow accounts created per DVP instruction.
+--    Immutable creation record for dual escrow accounts.
+--    Status transitions stored in escrow_account_events.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE escrow_accounts (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instruction_id      UUID            NOT NULL REFERENCES dvp_instructions(id),
-    leg_type            VARCHAR(20)     NOT NULL,    -- SECURITY | CASH
-    holder_entity_id    VARCHAR(100)    NOT NULL,    -- Entity funding the escrow
+    leg_type            VARCHAR(20)     NOT NULL,
+    holder_entity_id    VARCHAR(100)    NOT NULL,
     amount              DECIMAL(38,10)  NOT NULL,
     currency            VARCHAR(20)     NOT NULL,
-    status              VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
-    escrow_address      VARCHAR(256)    NOT NULL,    -- Smart contract address
-    on_chain_tx_hash    VARCHAR(256),               -- Transfer-to-escrow tx
-    funded_at           TIMESTAMPTZ,
-    released_at         TIMESTAMPTZ,
+    escrow_address      VARCHAR(256)    NOT NULL,
+    on_chain_tx_hash    VARCHAR(256),
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT chk_escrow_leg_type CHECK (leg_type IN ('SECURITY', 'CASH')),
-    CONSTRAINT chk_escrow_status   CHECK (status IN ('PENDING','LOCKED','IN_ESCROW','DELIVERED','RELEASED','FAILED'))
+    CONSTRAINT chk_escrow_leg_type CHECK (leg_type IN ('SECURITY', 'CASH'))
 );
 
 COMMENT ON TABLE escrow_accounts IS
-  'On-chain escrow state per DVP instruction. '
-  'Security escrow holds tokenized securities (ERC-1400). '
-  'Cash escrow holds tokenized cash / CBDC. '
-  'Neither can be released independently — only via atomic swap or multi-sig reversal.';
+  'Immutable creation record for escrow accounts. '
+  'Status transitions stored in escrow_account_events. '
+  'Query escrow_accounts_current view for current state.';
 
 CREATE INDEX idx_escrow_instruction ON escrow_accounts (instruction_id);
-CREATE INDEX idx_escrow_status      ON escrow_accounts (status);
+
+CREATE TRIGGER trg_deny_update_escrow_accounts
+    BEFORE UPDATE ON escrow_accounts FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_escrow_accounts
+    BEFORE DELETE ON escrow_accounts FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 8. multisig_approvals
---    Custodian approval votes for atomic swap authorization.
+-- 7a. escrow_account_events (append-only state transitions)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE escrow_account_events (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    escrow_id   UUID            NOT NULL REFERENCES escrow_accounts(id),
+    status      VARCHAR(20)     NOT NULL,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_escrow_event_status CHECK (
+        status IN ('PENDING','LOCKED','IN_ESCROW','DELIVERED','RELEASED','FAILED')
+    )
+);
+
+CREATE INDEX idx_escrow_events_escrow ON escrow_account_events (escrow_id, created_at);
+
+CREATE TRIGGER trg_deny_update_escrow_account_events
+    BEFORE UPDATE ON escrow_account_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_escrow_account_events
+    BEFORE DELETE ON escrow_account_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 7b. escrow_accounts_current (derived view)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW escrow_accounts_current AS
+SELECT
+    ea.id, ea.instruction_id, ea.leg_type,
+    ea.holder_entity_id, ea.amount, ea.currency,
+    ea.escrow_address, ea.on_chain_tx_hash, ea.created_at,
+    COALESCE(agg.status, 'PENDING')  AS status,
+    agg.funded_at,
+    agg.released_at
+FROM escrow_accounts ea
+LEFT JOIN LATERAL (
+    SELECT
+        (array_agg(e.status ORDER BY e.created_at DESC))[1]              AS status,
+        MIN(e.created_at) FILTER (WHERE e.status = 'IN_ESCROW')         AS funded_at,
+        MIN(e.created_at) FILTER (WHERE e.status IN ('DELIVERED','RELEASED')) AS released_at
+    FROM escrow_account_events e
+    WHERE e.escrow_id = ea.id
+) agg ON TRUE;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. multisig_approvals (already append-only)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE multisig_approvals (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instruction_id  UUID            NOT NULL REFERENCES dvp_instructions(id),
-    custodian_id    VARCHAR(100)    NOT NULL,    -- SWIFT BIC of custodian
-    signer_id       VARCHAR(256)    NOT NULL,    -- HSM key identifier / signatory ID
-    vote            VARCHAR(10)     NOT NULL,    -- APPROVE | REJECT | ABSTAIN
-    signature       VARCHAR(256)    NOT NULL,    -- HSM/MPC signature (simulated in sandbox)
+    custodian_id    VARCHAR(100)    NOT NULL,
+    signer_id       VARCHAR(256)    NOT NULL,
+    vote            VARCHAR(10)     NOT NULL,
+    signature       VARCHAR(256)    NOT NULL,
     voted_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     justification   TEXT,
 
-    -- One vote per custodian per instruction
     UNIQUE (instruction_id, custodian_id),
 
     CONSTRAINT chk_vote CHECK (vote IN ('APPROVE', 'REJECT', 'ABSTAIN'))
 );
 
-COMMENT ON TABLE multisig_approvals IS
-  'Multi-sig approval votes from custodians. '
-  'Default quorum: 2-of-3 (both custodians required, CCP optional). '
-  'Production: Fireblocks MPC / Thales Luna HSM / Gnosis Safe. '
-  'Signature field holds ECDSA / BIP-340 signature — simulated in sandbox.';
-
 CREATE INDEX idx_multisig_instruction ON multisig_approvals (instruction_id);
 CREATE INDEX idx_multisig_vote        ON multisig_approvals (vote);
+
+CREATE TRIGGER trg_deny_update_multisig_approvals
+    BEFORE UPDATE ON multisig_approvals FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_multisig_approvals
+    BEFORE DELETE ON multisig_approvals FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- 9. hybrid_rail_messages
---    Off-chain payment messages submitted to SWIFT / FedWire / CLS.
+--    Immutable creation record for off-chain payment messages.
+--    Status transitions stored in hybrid_rail_message_events.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE hybrid_rail_messages (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instruction_id  UUID            NOT NULL REFERENCES dvp_instructions(id),
-    rail            VARCHAR(20)     NOT NULL,    -- SWIFT | FEDWIRE | CLS | ONCHAIN | INTERNAL
-    message_type    VARCHAR(30)     NOT NULL,    -- MT103 | MT543 | FEDWIRE_CTR | CLS_DVP_MATCHED
+    rail            VARCHAR(20)     NOT NULL,
+    message_type    VARCHAR(30)     NOT NULL,
     payload         JSONB           NOT NULL,
-    status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
-    submitted_at    TIMESTAMPTZ,
-    confirmed_at    TIMESTAMPTZ,
-    rail_reference  VARCHAR(256),               -- SWIFT UETR | FedWire IMAD | CLS ref
+    rail_reference  VARCHAR(256),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT chk_rail   CHECK (rail IN ('SWIFT','FEDWIRE','CLS','ONCHAIN','INTERNAL')),
-    CONSTRAINT chk_status CHECK (status IN ('PENDING','SUBMITTED','CONFIRMED','REJECTED','TIMED_OUT'))
+    CONSTRAINT chk_rail CHECK (rail IN ('SWIFT','FEDWIRE','CLS','ONCHAIN','INTERNAL'))
 );
 
 COMMENT ON TABLE hybrid_rail_messages IS
-  'Off-chain payment messages per DVP instruction. '
-  'SWIFT MT543/MT103: securities + cash leg affirmations. '
-  'FedWire: USD same-day gross settlement (Tag 3600 CTR). '
-  'CLS: FX settlement elimination of Herstatt risk. '
-  'rail_reference is reconciled against on-chain settlement in the reconciliation engine.';
+  'Immutable creation record for off-chain payment messages. '
+  'Status transitions stored in hybrid_rail_message_events. '
+  'Query hybrid_rail_messages_current view for current state.';
 
 CREATE INDEX idx_rail_instruction  ON hybrid_rail_messages (instruction_id);
 CREATE INDEX idx_rail_reference    ON hybrid_rail_messages (rail_reference);
-CREATE INDEX idx_rail_status       ON hybrid_rail_messages (status);
+
+CREATE TRIGGER trg_deny_update_hybrid_rail_messages
+    BEFORE UPDATE ON hybrid_rail_messages FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_hybrid_rail_messages
+    BEFORE DELETE ON hybrid_rail_messages FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 10. outbox_events
+-- 9a. hybrid_rail_message_events (append-only state transitions)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE hybrid_rail_message_events (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    message_id  UUID            NOT NULL REFERENCES hybrid_rail_messages(id),
+    status      VARCHAR(20)     NOT NULL,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_rail_event_status CHECK (
+        status IN ('PENDING','SUBMITTED','CONFIRMED','REJECTED','TIMED_OUT')
+    )
+);
+
+CREATE INDEX idx_rail_events_message ON hybrid_rail_message_events (message_id, created_at);
+
+CREATE TRIGGER trg_deny_update_hybrid_rail_message_events
+    BEFORE UPDATE ON hybrid_rail_message_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_hybrid_rail_message_events
+    BEFORE DELETE ON hybrid_rail_message_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 9b. hybrid_rail_messages_current (derived view)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW hybrid_rail_messages_current AS
+SELECT
+    m.id, m.instruction_id, m.rail, m.message_type,
+    m.payload, m.rail_reference, m.created_at,
+    COALESCE(agg.status, 'PENDING')  AS status,
+    agg.submitted_at,
+    agg.confirmed_at
+FROM hybrid_rail_messages m
+LEFT JOIN LATERAL (
+    SELECT
+        (array_agg(e.status ORDER BY e.created_at DESC))[1]               AS status,
+        MIN(e.created_at) FILTER (WHERE e.status = 'SUBMITTED')           AS submitted_at,
+        MIN(e.created_at) FILTER (WHERE e.status = 'CONFIRMED')           AS confirmed_at
+    FROM hybrid_rail_message_events e
+    WHERE e.message_id = m.id
+) agg ON TRUE;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 10. outbox_events (immutable)
 --     Reliable Kafka delivery buffer — transactional outbox pattern.
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE outbox_events (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_id    VARCHAR(256)    NOT NULL,    -- DVP instruction ID
-    event_type      VARCHAR(100)    NOT NULL,    -- dvp.initiated | dvp.settled | …
+    aggregate_id    VARCHAR(256)    NOT NULL,
+    event_type      VARCHAR(100)    NOT NULL,
     payload         JSONB           NOT NULL,
-    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-    published_at    TIMESTAMPTZ,                -- NULL = pending Kafka delivery
-    dlq_at          TIMESTAMPTZ,               -- NULL = not dead-lettered
-    retry_count     INT             NOT NULL DEFAULT 0,
-    next_retry_at   TIMESTAMPTZ,
-    last_error      TEXT
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
 COMMENT ON TABLE outbox_events IS
-  'Transactional outbox buffer for Kafka. '
-  'Every service writes its event in the SAME DB transaction as the business record. '
-  'DVPOutboxPublisher polls this table with FOR UPDATE SKIP LOCKED '
-  'and marks published_at only after successful Kafka delivery. '
-  'Retry with exponential backoff (5s, 25s, 125s). DLQ after 3 failures.';
+  'Immutable transactional outbox buffer for Kafka. '
+  'Delivery status tracked in outbox_delivery_log (append-only). '
+  'Query outbox_events_current view for delivery status.';
 
-CREATE INDEX idx_outbox_unpublished ON outbox_events (created_at)
-    WHERE published_at IS NULL;
-CREATE INDEX idx_outbox_aggregate   ON outbox_events (aggregate_id);
-CREATE INDEX idx_outbox_next_retry  ON outbox_events (next_retry_at)
-    WHERE published_at IS NULL;
+CREATE INDEX idx_outbox_aggregate ON outbox_events (aggregate_id);
+CREATE INDEX idx_outbox_created   ON outbox_events (created_at);
+
+CREATE TRIGGER trg_deny_update_outbox_events
+    BEFORE UPDATE ON outbox_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_outbox_events
+    BEFORE DELETE ON outbox_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 11. reconciliation_reports
---     Post-settlement 4-source reconciliation results.
+-- 10a. outbox_delivery_log (append-only delivery tracking)
+--      Tracks Kafka delivery attempts, retries, and DLQ.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE outbox_delivery_log (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id    UUID            NOT NULL REFERENCES outbox_events(id),
+    status      VARCHAR(20)     NOT NULL,
+    error       TEXT,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT chk_delivery_status CHECK (
+        status IN ('PUBLISHED', 'RETRY', 'DLQ')
+    )
+);
+
+COMMENT ON TABLE outbox_delivery_log IS
+  'Append-only delivery tracking for outbox events. '
+  'Each row is an immutable record of a delivery attempt or result. '
+  'PUBLISHED: successfully delivered to Kafka. '
+  'RETRY: failed attempt with error. DLQ: dead-lettered after max retries.';
+
+CREATE UNIQUE INDEX idx_delivery_published ON outbox_delivery_log (event_id) WHERE status = 'PUBLISHED';
+CREATE UNIQUE INDEX idx_delivery_dlq       ON outbox_delivery_log (event_id) WHERE status = 'DLQ';
+CREATE INDEX idx_delivery_event            ON outbox_delivery_log (event_id, created_at);
+
+CREATE TRIGGER trg_deny_update_outbox_delivery_log
+    BEFORE UPDATE ON outbox_delivery_log FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_outbox_delivery_log
+    BEFORE DELETE ON outbox_delivery_log FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 10b. outbox_events_current (derived view)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VIEW outbox_events_current AS
+SELECT
+    oe.id, oe.aggregate_id, oe.event_type, oe.payload, oe.created_at,
+    COALESCE(agg.delivery_status, 'PENDING') AS delivery_status,
+    agg.published_at,
+    agg.dlq_at,
+    COALESCE(agg.retry_count, 0)             AS retry_count,
+    agg.last_error
+FROM outbox_events oe
+LEFT JOIN LATERAL (
+    SELECT
+        (array_agg(dl.status ORDER BY dl.created_at DESC))[1]             AS delivery_status,
+        MIN(dl.created_at) FILTER (WHERE dl.status = 'PUBLISHED')         AS published_at,
+        MIN(dl.created_at) FILTER (WHERE dl.status = 'DLQ')              AS dlq_at,
+        COUNT(*) FILTER (WHERE dl.status = 'RETRY')                       AS retry_count,
+        (array_agg(dl.error ORDER BY dl.created_at DESC)
+            FILTER (WHERE dl.error IS NOT NULL))[1]                       AS last_error
+    FROM outbox_delivery_log dl
+    WHERE dl.event_id = oe.id
+) agg ON TRUE;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 11. reconciliation_reports (already append-only)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE TABLE reconciliation_reports (
     id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     instruction_id              UUID            NOT NULL REFERENCES dvp_instructions(id),
-    result                      VARCHAR(20)     NOT NULL,    -- MATCHED | MISMATCH | SUSPENDED
+    result                      VARCHAR(20)     NOT NULL,
     security_leg_verified       BOOLEAN         NOT NULL,
     cash_leg_verified           BOOLEAN         NOT NULL,
     onchain_supply_matched      BOOLEAN         NOT NULL,
@@ -403,16 +835,13 @@ CREATE TABLE reconciliation_reports (
     CONSTRAINT chk_recon_result CHECK (result IN ('MATCHED','MISMATCH','SUSPENDED'))
 );
 
-COMMENT ON TABLE reconciliation_reports IS
-  'Post-settlement 4-source reconciliation: '
-  '(1) Internal Postgres ledger vs on-chain token balances, '
-  '(2) Rail payment confirmations (SWIFT ACK / FedWire IMAD / CLS confirm), '
-  '(3) Escrow account closure, (4) Custodian statement match. '
-  'MISMATCH immediately suspends all future settlements for the instruction '
-  'and pages the operations team.';
-
 CREATE INDEX idx_recon_instruction ON reconciliation_reports (instruction_id);
 CREATE INDEX idx_recon_result      ON reconciliation_reports (result);
+
+CREATE TRIGGER trg_deny_update_reconciliation_reports
+    BEFORE UPDATE ON reconciliation_reports FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_reconciliation_reports
+    BEFORE DELETE ON reconciliation_reports FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -420,7 +849,10 @@ CREATE INDEX idx_recon_result      ON reconciliation_reports (result);
 -- Scenario: BlackRock (seller) → State Street (buyer)
 --           500,000 AAPL shares at $195.00 = $97,500,000 USD
 --           Settlement rail: SWIFT (MT543 + MT103) + on-chain atomic swap
+--
+-- EVERY operation is an INSERT. No UPDATEs. No DELETEs.
 -- ═══════════════════════════════════════════════════════════════════════════
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- A. Register Institutional Participants
@@ -429,128 +861,55 @@ CREATE INDEX idx_recon_result      ON reconciliation_reports (result);
 INSERT INTO registered_entities
     (id, entity_name, lei, entity_type, jurisdiction, regulator, bic)
 VALUES
-    -- Seller: BlackRock (Asset Manager)
-    (
-        gen_random_uuid(),
-        'BlackRock, Inc.',
-        '549300BNMGNFKN6LAD61',
-        'ASSET_MANAGER',
-        'United States',
-        'SEC',
-        'BLRKUS33'
-    ),
-
-    -- Buyer: State Street (Custodian / Asset Manager)
-    (
-        gen_random_uuid(),
-        'State Street Bank and Trust Company',
-        '571474TGEMMWANRLN572',
-        'CUSTODIAN',
-        'United States',
-        'OCC / FRB',
-        'SBOSUS33'
-    ),
-
-    -- Seller Custodian: BNY Mellon (holds BlackRock's securities)
-    (
-        gen_random_uuid(),
-        'The Bank of New York Mellon',
-        'WFLLPEPC7FZXENRZV498',
-        'CUSTODIAN',
-        'United States',
-        'FRB / OCC',
-        'IRVTUS3N'
-    ),
-
-    -- CCP: DTCC (DTC)
-    (
-        gen_random_uuid(),
-        'Depository Trust & Clearing Corporation',
-        '213800ZBKL9BHSL2K459',
-        'CCP',
-        'United States',
-        'SEC / CFTC',
-        'DTCCUS3N'
-    );
+    (gen_random_uuid(), 'BlackRock, Inc.',
+     '549300BNMGNFKN6LAD61', 'ASSET_MANAGER', 'United States', 'SEC', 'BLRKUS33'),
+    (gen_random_uuid(), 'State Street Bank and Trust Company',
+     '571474TGEMMWANRLN572', 'CUSTODIAN', 'United States', 'OCC / FRB', 'SBOSUS33'),
+    (gen_random_uuid(), 'The Bank of New York Mellon',
+     'WFLLPEPC7FZXENRZV498', 'CUSTODIAN', 'United States', 'FRB / OCC', 'IRVTUS3N'),
+    (gen_random_uuid(), 'Depository Trust & Clearing Corporation',
+     '213800ZBKL9BHSL2K459', 'CCP', 'United States', 'SEC / CFTC', 'DTCCUS3N');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- B. Initialize Custody Positions
---    BlackRock holds 2,000,000 AAPL shares at BNY Mellon / DTC
+-- B. Initialize Custody Positions (metadata only)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO custody_positions
     (id, entity_id, isin, cusip, security_description,
-     available_quantity, locked_quantity, token_address, wallet_address, custodian)
+     token_address, wallet_address, custodian)
 VALUES
-    (
-        gen_random_uuid(),
-        '549300BNMGNFKN6LAD61',          -- BlackRock
-        'US0378331005',                   -- AAPL ISIN
-        '037833100',                      -- AAPL CUSIP
-        'Apple Inc. Common Stock',
-        2000000.0000000000,
-        0,
-        '0xAAPL_TOKEN_CONTRACT_ADDRESS',  -- Production: real ERC-1400 / ERC-3643 address
-        '0xBLACKROCK_WALLET_ADDRESS',
-        'DTC'
-    ),
+    (gen_random_uuid(), '549300BNMGNFKN6LAD61', 'US0378331005', '037833100',
+     'Apple Inc. Common Stock', '0xAAPL_TOKEN_CONTRACT_ADDRESS',
+     '0xBLACKROCK_WALLET_ADDRESS', 'DTC'),
+    (gen_random_uuid(), '571474TGEMMWANRLN572', 'US0378331005', '037833100',
+     'Apple Inc. Common Stock', '0xAAPL_TOKEN_CONTRACT_ADDRESS',
+     '0xSTATESTREET_WALLET_ADDRESS', 'DTC');
 
-    -- State Street starts with 0 AAPL (will receive via DVP)
-    (
-        gen_random_uuid(),
-        '571474TGEMMWANRLN572',           -- State Street
-        'US0378331005',                   -- AAPL ISIN
-        '037833100',
-        'Apple Inc. Common Stock',
-        0,
-        0,
-        '0xAAPL_TOKEN_CONTRACT_ADDRESS',
-        '0xSTATESTREET_WALLET_ADDRESS',
-        'DTC'
-    );
+-- Initial security balance via ledger entry
+INSERT INTO security_ledger (entity_id, isin, pool, amount, reason)
+VALUES ('549300BNMGNFKN6LAD61', 'US0378331005', 'AVAILABLE', 2000000.0000000000, 'INITIAL_BALANCE');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- C. Initialize Cash Accounts
---    State Street holds $500,000,000 USD (tokenized cash)
+-- C. Initialize Cash Accounts (metadata only)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO cash_accounts
-    (id, entity_id, currency, balance, available_balance, locked_balance,
-     account_type, bank_aba, swift_bic)
+    (id, entity_id, currency, account_type, bank_aba, swift_bic)
 VALUES
-    -- State Street: $500M USD
-    (
-        gen_random_uuid(),
-        '571474TGEMMWANRLN572',      -- State Street
-        'USD',
-        500000000.00,
-        500000000.00,
-        0.00,
-        'TOKENIZED_CASH',
-        '011000028',                 -- State Street ABA routing
-        'SBOSUS33'
-    ),
+    (gen_random_uuid(), '571474TGEMMWANRLN572', 'USD', 'TOKENIZED_CASH', '011000028', 'SBOSUS33'),
+    (gen_random_uuid(), '549300BNMGNFKN6LAD61', 'USD', 'TOKENIZED_CASH', '021000018', 'BLRKUS33');
 
-    -- BlackRock: $10M USD (will receive $97.5M from DVP)
-    (
-        gen_random_uuid(),
-        '549300BNMGNFKN6LAD61',      -- BlackRock
-        'USD',
-        10000000.00,
-        10000000.00,
-        0.00,
-        'TOKENIZED_CASH',
-        '021000018',                 -- BNY Mellon ABA routing (BlackRock's banking partner)
-        'BLRKUS33'
-    );
+-- Initial cash balances via ledger entries
+INSERT INTO cash_ledger (entity_id, currency, pool, amount, reason)
+VALUES
+    ('571474TGEMMWANRLN572', 'USD', 'AVAILABLE', 500000000.00, 'INITIAL_BALANCE'),
+    ('549300BNMGNFKN6LAD61', 'USD', 'AVAILABLE', 10000000.00, 'INITIAL_BALANCE');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- D. Create DVP Instruction
---    BlackRock sells 500,000 AAPL @ $195.00 to State Street
---    Settlement: SWIFT MT543 + on-chain atomic swap (T+0)
+-- D. Create DVP Instruction + INITIATED event
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO dvp_instructions (
@@ -560,29 +919,23 @@ INSERT INTO dvp_instructions (
     seller_wallet, buyer_wallet,
     seller_custodian, buyer_custodian,
     settlement_rail, intended_settlement_date,
-    status, idempotency_key, created_at
+    idempotency_key, created_at
 )
 VALUES (
-    'f47ac10b-58cc-4372-a567-0e02b2c3d479',    -- Fixed for demo
-    'BLK-SST-AAPL-20260320-001',               -- Trade reference
-    'US0378331005',                             -- AAPL ISIN
-    'EQUITY',
-    500000.0000000000,                          -- 500,000 shares
-    195.00,                                     -- $195.00 per share
-    97500000.00,                                -- $97,500,000 total
-    'USD',
-    '549300BNMGNFKN6LAD61',                    -- BlackRock (seller)
-    '571474TGEMMWANRLN572',                    -- State Street (buyer)
-    '0xBLACKROCK_WALLET_ADDRESS',
-    '0xSTATESTREET_WALLET_ADDRESS',
-    'IRVTUS3N',                                -- BNY Mellon (seller's custodian)
-    'SBOSUS33',                                -- State Street (buyer is also custodian)
-    'SWIFT',
-    '2026-03-20',                              -- T+0 (today)
-    'INITIATED',
-    'DVP-BLK-SST-AAPL-20260320-001',
-    NOW()
+    'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    'BLK-SST-AAPL-20260320-001',
+    'US0378331005', 'EQUITY',
+    500000.0000000000, 195.00, 97500000.00, 'USD',
+    '549300BNMGNFKN6LAD61', '571474TGEMMWANRLN572',
+    '0xBLACKROCK_WALLET_ADDRESS', '0xSTATESTREET_WALLET_ADDRESS',
+    'IRVTUS3N', 'SBOSUS33',
+    'SWIFT', '2026-03-20',
+    'DVP-BLK-SST-AAPL-20260320-001', NOW()
 );
+
+-- INITIATED event
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'INITIATED');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -595,8 +948,7 @@ INSERT INTO compliance_screenings
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-    '549300BNMGNFKN6LAD61',
-    '571474TGEMMWANRLN572',
+    '549300BNMGNFKN6LAD61', '571474TGEMMWANRLN572',
     TRUE,
     'Both counterparties cleared OFAC SDN, EU/UN consolidated, and PEP lists. '
     'No adverse media. LEI verified with GLEIF.',
@@ -604,71 +956,66 @@ VALUES (
     NOW()
 );
 
--- Advance status to COMPLIANCE_CHECK
-UPDATE dvp_instructions
-SET status     = 'COMPLIANCE_CHECK',
-    updated_at = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+-- Advance status: COMPLIANCE_CHECK
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'COMPLIANCE_CHECK');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- F. Lock Settlement Legs
 --    Atomically reserve securities (BlackRock) + cash (State Street)
+--    via append-only ledger entries
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Lock security leg (simulates SELECT … FOR UPDATE on custody_positions)
-UPDATE custody_positions
-SET available_quantity = available_quantity - 500000,
-    locked_quantity    = locked_quantity    + 500000,
-    updated_at         = NOW()
-WHERE entity_id = '549300BNMGNFKN6LAD61'
-  AND isin      = 'US0378331005';
+-- Lock security leg: move 500,000 from AVAILABLE to LOCKED for BlackRock
+INSERT INTO security_ledger (entity_id, isin, pool, amount, instruction_id, reason)
+VALUES
+    ('549300BNMGNFKN6LAD61', 'US0378331005', 'AVAILABLE', -500000.0000000000,
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK'),
+    ('549300BNMGNFKN6LAD61', 'US0378331005', 'LOCKED', 500000.0000000000,
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK');
 
--- Lock cash leg (simulates SELECT … FOR UPDATE on cash_accounts)
-UPDATE cash_accounts
-SET available_balance = available_balance - 97500000,
-    locked_balance    = locked_balance    + 97500000,
-    updated_at        = NOW()
-WHERE entity_id = '571474TGEMMWANRLN572'
-  AND currency  = 'USD';
+-- Lock cash leg: move $97,500,000 from AVAILABLE to LOCKED for State Street
+INSERT INTO cash_ledger (entity_id, currency, pool, amount, instruction_id, reason)
+VALUES
+    ('571474TGEMMWANRLN572', 'USD', 'AVAILABLE', -97500000.00,
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK'),
+    ('571474TGEMMWANRLN572', 'USD', 'LOCKED', 97500000.00,
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK');
 
--- Insert security leg
+-- Create security leg (immutable record)
 INSERT INTO settlement_legs
     (id, instruction_id, leg_type, originator_entity_id, beneficiary_entity_id,
-     amount, currency, status, locked_at)
+     amount, currency)
 VALUES (
     'aaaa0001-0000-0000-0000-000000000001',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-    'SECURITY',
-    '549300BNMGNFKN6LAD61',     -- BlackRock (seller/originator)
-    '571474TGEMMWANRLN572',     -- State Street (buyer/beneficiary)
-    500000.0000000000,
-    'US0378331005',             -- ISIN as currency identifier for securities
-    'LOCKED',
-    NOW()
+    'SECURITY', '549300BNMGNFKN6LAD61', '571474TGEMMWANRLN572',
+    500000.0000000000, 'US0378331005'
 );
 
--- Insert cash leg
+-- Security leg status: LOCKED
+INSERT INTO settlement_leg_events (leg_id, status)
+VALUES ('aaaa0001-0000-0000-0000-000000000001', 'LOCKED');
+
+-- Create cash leg (immutable record)
 INSERT INTO settlement_legs
     (id, instruction_id, leg_type, originator_entity_id, beneficiary_entity_id,
-     amount, currency, status, locked_at)
+     amount, currency)
 VALUES (
     'bbbb0002-0000-0000-0000-000000000002',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-    'CASH',
-    '571474TGEMMWANRLN572',     -- State Street (buyer/originator)
-    '549300BNMGNFKN6LAD61',    -- BlackRock (seller/beneficiary)
-    97500000.00,
-    'USD',
-    'LOCKED',
-    NOW()
+    'CASH', '571474TGEMMWANRLN572', '549300BNMGNFKN6LAD61',
+    97500000.00, 'USD'
 );
 
--- Advance instruction status
-UPDATE dvp_instructions
-SET status     = 'LEGS_LOCKED',
-    updated_at = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+-- Cash leg status: LOCKED
+INSERT INTO settlement_leg_events (leg_id, status)
+VALUES ('bbbb0002-0000-0000-0000-000000000002', 'LOCKED');
+
+-- Advance instruction status: LEGS_LOCKED
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LEGS_LOCKED');
 
 -- Outbox event: legs_locked
 INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
@@ -691,52 +1038,49 @@ VALUES (
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- G. Fund Escrow Accounts
---    On-chain transfers to smart contract escrow addresses
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- Create security escrow (immutable record)
 INSERT INTO escrow_accounts
     (id, instruction_id, leg_type, holder_entity_id, amount, currency,
-     status, escrow_address, on_chain_tx_hash, funded_at)
+     escrow_address, on_chain_tx_hash)
+VALUES (
+    'cccc0003-0000-0000-0000-000000000003',
+    'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    'SECURITY', '549300BNMGNFKN6LAD61', 500000.0000000000, 'US0378331005',
+    '0xSECURITY_ESCROW_CONTRACT_ADDRESS',
+    '0xabc123def456789012345678901234567890123456789012345678901234abcd'
+);
+
+-- Security escrow status: IN_ESCROW
+INSERT INTO escrow_account_events (escrow_id, status)
+VALUES ('cccc0003-0000-0000-0000-000000000003', 'IN_ESCROW');
+
+-- Create cash escrow (immutable record)
+INSERT INTO escrow_accounts
+    (id, instruction_id, leg_type, holder_entity_id, amount, currency,
+     escrow_address, on_chain_tx_hash)
+VALUES (
+    'dddd0004-0000-0000-0000-000000000004',
+    'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    'CASH', '571474TGEMMWANRLN572', 97500000.00, 'USD',
+    '0xCASH_ESCROW_CONTRACT_ADDRESS',
+    '0xdef456abc123012345678901234567890123456789012345678901234567def0'
+);
+
+-- Cash escrow status: IN_ESCROW
+INSERT INTO escrow_account_events (escrow_id, status)
+VALUES ('dddd0004-0000-0000-0000-000000000004', 'IN_ESCROW');
+
+-- Leg status: IN_ESCROW
+INSERT INTO settlement_leg_events (leg_id, status)
 VALUES
-    -- Security escrow (BlackRock's AAPL tokens)
-    (
-        'cccc0003-0000-0000-0000-000000000003',
-        'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        'SECURITY',
-        '549300BNMGNFKN6LAD61',
-        500000.0000000000,
-        'US0378331005',
-        'IN_ESCROW',
-        '0xSECURITY_ESCROW_CONTRACT_ADDRESS',
-        '0xabc123def456789012345678901234567890123456789012345678901234abcd',  -- Simulated tx hash
-        NOW()
-    ),
+    ('aaaa0001-0000-0000-0000-000000000001', 'IN_ESCROW'),
+    ('bbbb0002-0000-0000-0000-000000000002', 'IN_ESCROW');
 
-    -- Cash escrow (State Street's USD tokenized cash)
-    (
-        'dddd0004-0000-0000-0000-000000000004',
-        'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        'CASH',
-        '571474TGEMMWANRLN572',
-        97500000.00,
-        'USD',
-        'IN_ESCROW',
-        '0xCASH_ESCROW_CONTRACT_ADDRESS',
-        '0xdef456abc123012345678901234567890123456789012345678901234567def0',   -- Simulated tx hash
-        NOW()
-    );
-
--- Update legs to IN_ESCROW
-UPDATE settlement_legs
-SET status     = 'IN_ESCROW',
-    updated_at = NOW()
-WHERE instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
-
--- Advance instruction status
-UPDATE dvp_instructions
-SET status     = 'ESCROW_FUNDED',
-    updated_at = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+-- Advance instruction status: ESCROW_FUNDED
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ESCROW_FUNDED');
 
 -- Outbox event: escrow_funded
 INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
@@ -759,98 +1103,80 @@ VALUES (
 -- H. Submit SWIFT Messages (MT543 + MT103)
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- Create MT543 message (immutable record)
 INSERT INTO hybrid_rail_messages
-    (id, instruction_id, rail, message_type, payload, status, submitted_at, rail_reference)
-VALUES
-    -- MT543: Deliver Against Payment (Securities Leg — Seller side)
-    (
-        gen_random_uuid(),
-        'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        'SWIFT',
-        'MT543',
-        '{
-            "message_type": "MT543",
-            "uetr": "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
-            "sender_bic": "IRVTUS3N",
-            "receiver_bic": "SBOSUS33",
-            "isin": "US0378331005",
-            "quantity": "500000",
-            "settlement_amount": "97500000",
-            "currency": "USD",
-            "settlement_date": "2026-03-20",
-            "trade_reference": "BLK-SST-AAPL-20260320-001",
-            "seller_account": "0xBLACKROCK_WALLET_ADDRESS",
-            "buyer_account": "0xSTATESTREET_WALLET_ADDRESS"
-        }'::jsonb,
-        'SUBMITTED',
-        NOW(),
-        'a1b2c3d4-e5f6-7890-abcd-ef0123456789'    -- SWIFT UETR
-    ),
+    (id, instruction_id, rail, message_type, payload, rail_reference)
+VALUES (
+    'ee110001-0000-0000-0000-000000000005',
+    'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    'SWIFT', 'MT543',
+    '{
+        "message_type": "MT543",
+        "uetr": "a1b2c3d4-e5f6-7890-abcd-ef0123456789",
+        "sender_bic": "IRVTUS3N",
+        "receiver_bic": "SBOSUS33",
+        "isin": "US0378331005",
+        "quantity": "500000",
+        "settlement_amount": "97500000",
+        "currency": "USD",
+        "settlement_date": "2026-03-20",
+        "trade_reference": "BLK-SST-AAPL-20260320-001",
+        "seller_account": "0xBLACKROCK_WALLET_ADDRESS",
+        "buyer_account": "0xSTATESTREET_WALLET_ADDRESS"
+    }'::jsonb,
+    'a1b2c3d4-e5f6-7890-abcd-ef0123456789'
+);
 
-    -- MT103: Cash Leg Credit Transfer (Buyer pays Seller)
-    (
-        gen_random_uuid(),
-        'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        'SWIFT',
-        'MT103',
-        '{
-            "message_type": "MT103",
-            "uetr": "b2c3d4e5-f6a1-8901-bcde-f01234567890",
-            "sender_bic": "SBOSUS33",
-            "receiver_bic": "IRVTUS3N",
-            "amount": "97500000",
-            "currency": "USD",
-            "value_date": "2026-03-20",
-            "remittance_info": "DVP/BLK-SST-AAPL-20260320-001/US0378331005"
-        }'::jsonb,
-        'SUBMITTED',
-        NOW(),
-        'b2c3d4e5-f6a1-8901-bcde-f01234567890'    -- SWIFT UETR
-    );
+-- MT543 status: SUBMITTED
+INSERT INTO hybrid_rail_message_events (message_id, status)
+VALUES ('ee110001-0000-0000-0000-000000000005', 'SUBMITTED');
+
+-- Create MT103 message (immutable record)
+INSERT INTO hybrid_rail_messages
+    (id, instruction_id, rail, message_type, payload, rail_reference)
+VALUES (
+    'ff220002-0000-0000-0000-000000000006',
+    'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    'SWIFT', 'MT103',
+    '{
+        "message_type": "MT103",
+        "uetr": "b2c3d4e5-f6a1-8901-bcde-f01234567890",
+        "sender_bic": "SBOSUS33",
+        "receiver_bic": "IRVTUS3N",
+        "amount": "97500000",
+        "currency": "USD",
+        "value_date": "2026-03-20",
+        "remittance_info": "DVP/BLK-SST-AAPL-20260320-001/US0378331005"
+    }'::jsonb,
+    'b2c3d4e5-f6a1-8901-bcde-f01234567890'
+);
+
+-- MT103 status: SUBMITTED
+INSERT INTO hybrid_rail_message_events (message_id, status)
+VALUES ('ff220002-0000-0000-0000-000000000006', 'SUBMITTED');
 
 -- Advance to MULTISIG_PENDING
-UPDATE dvp_instructions
-SET status     = 'MULTISIG_PENDING',
-    updated_at = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MULTISIG_PENDING');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- I. Multi-Sig Approval Votes
---    BNY Mellon (seller's custodian) + State Street (buyer's custodian)
---    Both APPROVE → quorum of 2 reached → MULTISIG_APPROVED
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO multisig_approvals
     (id, instruction_id, custodian_id, signer_id, vote, signature, voted_at)
 VALUES
-    -- Vote 1: BNY Mellon (BlackRock's custodian) approves
-    (
-        gen_random_uuid(),
-        'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        'IRVTUS3N',                          -- BNY Mellon SWIFT BIC
-        'HSM-BNYM-SIGNER-KEY-001',           -- Production: CloudHSM key ID
-        'APPROVE',
-        'sha256:bnym_simulated_ecdsa_signature_approval_f47ac10b_20260320',
-        NOW()
-    ),
+    (gen_random_uuid(), 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+     'IRVTUS3N', 'HSM-BNYM-SIGNER-KEY-001', 'APPROVE',
+     'sha256:bnym_simulated_ecdsa_signature_approval_f47ac10b_20260320', NOW()),
+    (gen_random_uuid(), 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+     'SBOSUS33', 'HSM-SST-SIGNER-KEY-007', 'APPROVE',
+     'sha256:sst_simulated_ecdsa_signature_approval_f47ac10b_20260320', NOW());
 
-    -- Vote 2: State Street (buyer, also custodian) approves
-    (
-        gen_random_uuid(),
-        'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        'SBOSUS33',                          -- State Street SWIFT BIC
-        'HSM-SST-SIGNER-KEY-007',
-        'APPROVE',
-        'sha256:sst_simulated_ecdsa_signature_approval_f47ac10b_20260320',
-        NOW()
-    );
-
--- Quorum reached (2-of-2 APPROVE, 0 REJECT) — advance to MULTISIG_APPROVED
-UPDATE dvp_instructions
-SET status     = 'MULTISIG_APPROVED',
-    updated_at = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+-- Quorum reached: MULTISIG_APPROVED
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MULTISIG_APPROVED');
 
 -- Outbox event: multisig_approved
 INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
@@ -865,75 +1191,55 @@ VALUES (
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- J. Atomic Swap — IRREVOCABLE Settlement
---    Both escrow accounts released simultaneously on-chain
---    Securities → State Street | Cash → BlackRock
+--    All balance changes via append-only ledger INSERTs.
+--    State transitions via event INSERTs. Zero UPDATEs.
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Mark as ATOMIC_SWAP (irrevocable — crash recovery reads this to avoid re-entry)
-UPDATE dvp_instructions
-SET status     = 'ATOMIC_SWAP',
-    updated_at = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
-
--- Simulated on-chain atomic swap tx hash
--- Production: This is the hash of the smart contract atomic swap tx
--- containing BOTH escrow releases in a single tx
+-- Mark as ATOMIC_SWAP (crash recovery marker)
+INSERT INTO dvp_instruction_events (instruction_id, status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ATOMIC_SWAP');
 
 -- Finalize settlement — atomic ledger update
 BEGIN;
 
-    -- 1. Mark instruction as SETTLED
-    UPDATE dvp_instructions
-    SET status        = 'SETTLED',
-        swap_tx_hash  = '0xATOMIC_SWAP_TX_HASH_f47ac10b_20260320_IRREVOCABLE',
-        settled_at    = NOW(),
-        updated_at    = NOW()
-    WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+    -- 1. Mark instruction as SETTLED with swap tx hash
+    INSERT INTO dvp_instruction_events (instruction_id, status, swap_tx_hash)
+    VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'SETTLED',
+            '0xATOMIC_SWAP_TX_HASH_f47ac10b_20260320_IRREVOCABLE');
 
-    -- 2. Release security lock from BlackRock (deduct locked_quantity)
-    UPDATE custody_positions
-    SET locked_quantity = locked_quantity - 500000,
-        updated_at      = NOW()
-    WHERE entity_id = '549300BNMGNFKN6LAD61'
-      AND isin      = 'US0378331005';
+    -- 2. Security: debit seller's LOCKED pool
+    INSERT INTO security_ledger (entity_id, isin, pool, amount, instruction_id, reason)
+    VALUES ('549300BNMGNFKN6LAD61', 'US0378331005', 'LOCKED', -500000.0000000000,
+            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_DEBIT');
 
-    -- 3. Release cash lock from State Street (deduct balance + locked)
-    UPDATE cash_accounts
-    SET balance         = balance         - 97500000,
-        locked_balance  = locked_balance  - 97500000,
-        updated_at      = NOW()
-    WHERE entity_id = '571474TGEMMWANRLN572'
-      AND currency  = 'USD';
+    -- 3. Cash: debit buyer's LOCKED pool
+    INSERT INTO cash_ledger (entity_id, currency, pool, amount, instruction_id, reason)
+    VALUES ('571474TGEMMWANRLN572', 'USD', 'LOCKED', -97500000.00,
+            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_DEBIT');
 
-    -- 4. Credit AAPL to State Street (buyer receives securities)
-    UPDATE custody_positions
-    SET available_quantity = available_quantity + 500000,
-        updated_at         = NOW()
-    WHERE entity_id = '571474TGEMMWANRLN572'
-      AND isin      = 'US0378331005';
+    -- 4. Security: credit buyer's AVAILABLE pool
+    INSERT INTO security_ledger (entity_id, isin, pool, amount, instruction_id, reason)
+    VALUES ('571474TGEMMWANRLN572', 'US0378331005', 'AVAILABLE', 500000.0000000000,
+            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_CREDIT');
 
-    -- 5. Credit USD to BlackRock (seller receives cash)
-    UPDATE cash_accounts
-    SET balance           = balance           + 97500000,
-        available_balance = available_balance + 97500000,
-        updated_at        = NOW()
-    WHERE entity_id = '549300BNMGNFKN6LAD61'
-      AND currency  = 'USD';
+    -- 5. Cash: credit seller's AVAILABLE pool
+    INSERT INTO cash_ledger (entity_id, currency, pool, amount, instruction_id, reason)
+    VALUES ('549300BNMGNFKN6LAD61', 'USD', 'AVAILABLE', 97500000.00,
+            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_CREDIT');
 
-    -- 6. Mark escrow accounts as DELIVERED
-    UPDATE escrow_accounts
-    SET status       = 'DELIVERED',
-        released_at  = NOW()
-    WHERE instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+    -- 6. Escrow accounts: DELIVERED
+    INSERT INTO escrow_account_events (escrow_id, status)
+    VALUES
+        ('cccc0003-0000-0000-0000-000000000003', 'DELIVERED'),
+        ('dddd0004-0000-0000-0000-000000000004', 'DELIVERED');
 
-    -- 7. Mark settlement legs as DELIVERED
-    UPDATE settlement_legs
-    SET status       = 'DELIVERED',
-        delivered_at = NOW(),
-        updated_at   = NOW()
-    WHERE instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+    -- 7. Settlement legs: DELIVERED
+    INSERT INTO settlement_leg_events (leg_id, status)
+    VALUES
+        ('aaaa0001-0000-0000-0000-000000000001', 'DELIVERED'),
+        ('bbbb0002-0000-0000-0000-000000000002', 'DELIVERED');
 
-    -- 8. Outbox event: settled (triggers MiFID II / EMIR reporting, DTCC STP)
+    -- 8. Outbox event: settled
     INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
     VALUES (
         gen_random_uuid(),
@@ -958,19 +1264,17 @@ COMMIT;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- K. Confirm SWIFT Messages (simulating ACK from SWIFT network)
+-- K. Confirm SWIFT Messages
 -- ─────────────────────────────────────────────────────────────────────────────
 
-UPDATE hybrid_rail_messages
-SET status       = 'CONFIRMED',
-    confirmed_at = NOW()
-WHERE instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
-  AND rail = 'SWIFT';
+INSERT INTO hybrid_rail_message_events (message_id, status)
+VALUES
+    ('ee110001-0000-0000-0000-000000000005', 'CONFIRMED'),
+    ('ff220002-0000-0000-0000-000000000006', 'CONFIRMED');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- L. Post-Settlement Reconciliation
---    4-source check: ledger ✓ | escrow ✓ | legs ✓ | rail ✓ → MATCHED
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO reconciliation_reports
@@ -981,20 +1285,13 @@ INSERT INTO reconciliation_reports
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-    'MATCHED',
-    TRUE,   -- State Street now holds 500,000 AAPL on-chain and in ledger
-    TRUE,   -- BlackRock now holds $107.5M USD ($10M + $97.5M) in ledger
-    TRUE,   -- Escrow accounts marked DELIVERED, on-chain balances match
-    TRUE,   -- MT543 + MT103 both CONFIRMED
-    '[]'::jsonb,
-    NOW()
+    'MATCHED', TRUE, TRUE, TRUE, TRUE,
+    '[]'::jsonb, NOW()
 );
 
--- Mark reconciliation status on instruction
-UPDATE dvp_instructions
-SET reconciliation_status = 'MATCHED',
-    updated_at            = NOW()
-WHERE id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+-- Reconciliation status event
+INSERT INTO dvp_instruction_events (instruction_id, reconciliation_status)
+VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MATCHED');
 
 -- Outbox event: reconciliation passed
 INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
@@ -1009,7 +1306,9 @@ VALUES (
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- VERIFICATION QUERIES
+-- All queries use _current views for derived state.
 -- ═══════════════════════════════════════════════════════════════════════════
+
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- V1. Full DVP Instruction Overview
@@ -1028,40 +1327,37 @@ SELECT
     d.intended_settlement_date,
     d.settled_at,
     d.swap_tx_hash
-FROM dvp_instructions d
+FROM dvp_instructions_current d
 WHERE d.id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- V2. Post-Settlement Position Verification
---    Expected:
---      BlackRock AAPL:  1,500,000 available (delivered 500K)
---      State Street AAPL: 500,000 available (received 500K)
---      BlackRock USD:  $107,500,000 ($10M + $97.5M received)
---      State Street USD: $402,500,000 ($500M - $97.5M paid)
+-- V2. Post-Settlement Position Verification (derived from ledger views)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 SELECT
     e.entity_name,
-    cp.isin,
+    cb.isin,
     cp.security_description,
-    cp.available_quantity,
-    cp.locked_quantity,
+    cb.available_quantity,
+    cb.locked_quantity,
     cp.custodian
-FROM custody_positions cp
-JOIN registered_entities e ON e.lei = cp.entity_id
-WHERE cp.isin = 'US0378331005'
+FROM custody_balances cb
+JOIN custody_positions cp ON cp.entity_id = cb.entity_id AND cp.isin = cb.isin
+JOIN registered_entities e ON e.lei = cb.entity_id
+WHERE cb.isin = 'US0378331005'
 ORDER BY e.entity_name;
 
 SELECT
     e.entity_name,
-    ca.currency,
-    '$' || TO_CHAR(ca.balance,           'FM999,999,999.00') AS total_balance,
-    '$' || TO_CHAR(ca.available_balance, 'FM999,999,999.00') AS available_balance,
-    '$' || TO_CHAR(ca.locked_balance,    'FM999,999,999.00') AS locked_balance,
+    cb.currency,
+    '$' || TO_CHAR(cb.balance,           'FM999,999,999.00') AS total_balance,
+    '$' || TO_CHAR(cb.available_balance, 'FM999,999,999.00') AS available_balance,
+    '$' || TO_CHAR(cb.locked_balance,    'FM999,999,999.00') AS locked_balance,
     ca.account_type
-FROM cash_accounts ca
-JOIN registered_entities e ON e.lei = ca.entity_id
+FROM cash_balances cb
+JOIN cash_accounts ca ON ca.entity_id = cb.entity_id AND ca.currency = cb.currency
+JOIN registered_entities e ON e.lei = cb.entity_id
 ORDER BY e.entity_name;
 
 
@@ -1078,7 +1374,7 @@ SELECT
     sl.status,
     sl.locked_at,
     sl.delivered_at
-FROM settlement_legs sl
+FROM settlement_legs_current sl
 WHERE sl.instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 ORDER BY sl.leg_type;
 
@@ -1097,7 +1393,7 @@ SELECT
     LEFT(ea.on_chain_tx_hash, 20) || '...' AS tx_hash_preview,
     ea.funded_at,
     ea.released_at
-FROM escrow_accounts ea
+FROM escrow_accounts_current ea
 WHERE ea.instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
 
 
@@ -1115,7 +1411,6 @@ FROM multisig_approvals ma
 WHERE ma.instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 ORDER BY ma.voted_at;
 
--- Quorum check
 SELECT
     COUNT(*) FILTER (WHERE vote = 'APPROVE') AS approve_votes,
     COUNT(*) FILTER (WHERE vote = 'REJECT')  AS reject_votes,
@@ -1131,7 +1426,7 @@ WHERE instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- V6. Hybrid Rail Message Status (SWIFT ACK verification)
+-- V6. Hybrid Rail Message Status
 -- ─────────────────────────────────────────────────────────────────────────────
 
 SELECT
@@ -1141,21 +1436,21 @@ SELECT
     hrm.rail_reference                        AS uetr_or_imad,
     hrm.submitted_at,
     hrm.confirmed_at
-FROM hybrid_rail_messages hrm
+FROM hybrid_rail_messages_current hrm
 WHERE hrm.instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 ORDER BY hrm.submitted_at;
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- V7. Outbox Event Delivery Queue (Kafka feed)
+-- V7. Outbox Event Delivery Queue
 -- ─────────────────────────────────────────────────────────────────────────────
 
 SELECT
     event_type,
     created_at,
-    published_at,
-    CASE WHEN published_at IS NULL THEN 'PENDING' ELSE 'DELIVERED' END AS kafka_status
-FROM outbox_events
+    delivery_status,
+    published_at
+FROM outbox_events_current
 WHERE aggregate_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 ORDER BY created_at;
 
@@ -1192,29 +1487,45 @@ SELECT
         WHERE ma.instruction_id = d.id AND ma.vote = 'APPROVE'
     )                                                       AS multisig_approvals,
     (
-        SELECT COUNT(*) FROM hybrid_rail_messages hrm
+        SELECT COUNT(*) FROM hybrid_rail_messages_current hrm
         WHERE hrm.instruction_id = d.id AND hrm.status = 'CONFIRMED'
     )                                                       AS rail_messages_confirmed,
     rr.result                                               AS reconciliation_result,
     LEFT(d.swap_tx_hash, 30) || '...'                       AS atomic_swap_tx,
     d.settled_at
-FROM dvp_instructions d
+FROM dvp_instructions_current d
 LEFT JOIN compliance_screenings cs  ON cs.instruction_id = d.id
 LEFT JOIN reconciliation_reports rr ON rr.instruction_id = d.id
 WHERE d.id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- V10. Full State Machine Audit Trail
+-- V10. Full State Machine Audit Trail (from event log)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 SELECT
-    event_type                          AS state_transition,
-    created_at                          AS occurred_at,
-    payload->>'instruction_id'          AS instruction_id
-FROM outbox_events
-WHERE aggregate_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
+    COALESCE(status, 'RECONCILIATION') AS state_transition,
+    COALESCE(reconciliation_status, '')  AS reconciliation_status,
+    created_at                           AS occurred_at
+FROM dvp_instruction_events
+WHERE instruction_id = 'f47ac10b-58cc-4372-a567-0e02b2c3d479'
 ORDER BY created_at;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- V11. Ledger Audit Trail (append-only — every entry is immutable)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+SELECT 'SECURITY' AS ledger, entity_id, isin AS asset, pool, amount, reason, created_at
+FROM security_ledger
+WHERE isin = 'US0378331005'
+ORDER BY created_at;
+
+SELECT 'CASH' AS ledger, entity_id, currency AS asset, pool, amount, reason, created_at
+FROM cash_ledger
+WHERE currency = 'USD'
+ORDER BY created_at;
+
 
 /*
 ══════════════════════════════════════════════════════════════════════════════
@@ -1233,38 +1544,34 @@ EXPECTED FINAL STATE (V9 Summary Query)
   atomic_swap_tx            = 0xATOMIC_SWAP_TX_HASH_f47ac10...
   settled_at                = [timestamp]
 
-EXPECTED POSITION STATE (V2 Queries)
+APPEND-ONLY ARCHITECTURE:
 ══════════════════════════════════════════════════════════════════════════════
 
-  Custody Positions (AAPL):
-  ┌──────────────────────────────┬─────────────────────────┬────────────┐
-  │ Entity                       │ Available Quantity       │ Locked     │
-  ├──────────────────────────────┼─────────────────────────┼────────────┤
-  │ BlackRock, Inc.              │ 1,500,000               │ 0          │
-  │ State Street Bank and Trust  │   500,000               │ 0          │
-  └──────────────────────────────┴─────────────────────────┴────────────┘
+  Every table is INSERT-only. No UPDATEs. No DELETEs.
+  Database-level BEFORE triggers prevent any mutation.
 
-  Cash Accounts (USD):
-  ┌──────────────────────────────┬────────────────────┬────────┐
-  │ Entity                       │ Available Balance   │ Locked │
-  ├──────────────────────────────┼────────────────────┼────────┤
-  │ BlackRock, Inc.              │ $107,500,000.00    │ $0     │
-  │ State Street Bank and Trust  │ $402,500,000.00    │ $0     │
-  └──────────────────────────────┴────────────────────┴────────┘
+  Financial state:   security_ledger / cash_ledger (double-entry, signed amounts)
+  Derived balances:  custody_balances / cash_balances (SUM views)
+  State machines:    *_events tables (append-only status transitions)
+  Current state:     *_current views (latest event per entity)
 
-STATE MACHINE TRACE:
-  dvp.initiated              → INITIATED
-  dvp.legs_locked            → LEGS_LOCKED
-  dvp.escrow_funded          → ESCROW_FUNDED
-  dvp.multisig_approved      → MULTISIG_APPROVED
-  dvp.atomic_swap_initiated  → ATOMIC_SWAP
-  dvp.settled                → SETTLED (irrevocable)
-  dvp.reconciliation_matched → MATCHED
+LEDGER AUDIT TRAIL (V11):
+  SECURITY | BlackRock  | AAPL | AVAILABLE | +2,000,000 | INITIAL_BALANCE
+  SECURITY | BlackRock  | AAPL | AVAILABLE |   -500,000 | LOCK
+  SECURITY | BlackRock  | AAPL | LOCKED    |   +500,000 | LOCK
+  SECURITY | BlackRock  | AAPL | LOCKED    |   -500,000 | DELIVERY_DEBIT
+  SECURITY | State St   | AAPL | AVAILABLE |   +500,000 | DELIVERY_CREDIT
+  CASH     | State St   | USD  | AVAILABLE | +500,000,000 | INITIAL_BALANCE
+  CASH     | BlackRock  | USD  | AVAILABLE |  +10,000,000 | INITIAL_BALANCE
+  CASH     | State St   | USD  | AVAILABLE |  -97,500,000 | LOCK
+  CASH     | State St   | USD  | LOCKED    |  +97,500,000 | LOCK
+  CASH     | State St   | USD  | LOCKED    |  -97,500,000 | DELIVERY_DEBIT
+  CASH     | BlackRock  | USD  | AVAILABLE |  +97,500,000 | DELIVERY_CREDIT
 
-KAFKA TOPICS PRODUCED:
-  dvp.initiated | dvp.legs_locked | dvp.escrow_funded
-  dvp.multisig_vote (×2) | dvp.multisig_approved
-  dvp.atomic_swap_initiated | dvp.settled | dvp.reconciliation_matched
+STATE MACHINE TRACE (from dvp_instruction_events):
+  INITIATED → COMPLIANCE_CHECK → LEGS_LOCKED → ESCROW_FUNDED
+  → MULTISIG_PENDING → MULTISIG_APPROVED → ATOMIC_SWAP
+  → SETTLED (irrevocable) → reconciliation_status = MATCHED
 
 ══════════════════════════════════════════════════════════════════════════════
 */
