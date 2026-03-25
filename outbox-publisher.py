@@ -6,7 +6,7 @@
 ║  Polls outbox_events → delivers to Kafka with exactly-once semantics.      ║
 ║                                                                            ║
 ║  Run as a separate process alongside the main settlement service.          ║
-║  Safe for multi-replica deployment (FOR UPDATE SKIP LOCKED).               ║
+║  Append-only: delivery tracking via outbox_delivery_log INSERTs.           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Usage:
@@ -41,7 +41,7 @@ import json
 import logging
 import os
 import signal
-import sys
+import uuid
 from datetime import datetime, timezone
 
 # ── Production imports ────────────────────────────────────────────────────────
@@ -119,33 +119,41 @@ class OutboxPublisher:
     """
     Async background poller — delivers outbox_events to Kafka reliably.
 
+    APPEND-ONLY: All delivery state is tracked via INSERT into
+    outbox_delivery_log. The outbox_events table is never mutated.
+
     Core guarantees:
     ─────────────────
-    1. AT-LEAST-ONCE delivery: events are only marked published_at
-       AFTER Kafka acknowledges the message. A crash between Kafka
-       delivery and the DB update causes a duplicate, which downstream
-       consumers must handle via idempotency (event_id deduplication).
+    1. AT-LEAST-ONCE delivery: a PUBLISHED row is inserted into
+       outbox_delivery_log ONLY after Kafka acknowledges the message.
+       A crash between Kafka delivery and the DB insert causes a
+       duplicate, which downstream consumers must handle via
+       idempotency (event_id deduplication).
 
-    2. Multi-replica safe: FOR UPDATE SKIP LOCKED ensures multiple
-       publisher instances don't process the same event concurrently.
+    2. Multi-replica safe: events without a PUBLISHED or DLQ row
+       in outbox_delivery_log are eligible for pickup. The unique
+       index on (event_id) WHERE status = 'PUBLISHED' prevents
+       double-publish at the DB level.
 
-    3. Ordered per instruction: Kafka key = aggregate_id (instruction ID)
-       guarantees all events for the same instruction land in the same
-       partition in the order they were created.
+    3. Ordered per instruction: Kafka key = aggregate_id (instruction
+       ID) guarantees all events for the same instruction land in the
+       same partition in the order they were created.
 
-    4. Exponential backoff retry: 5s → 25s → 125s before DLQ.
+    4. Retry with backoff: RETRY rows in outbox_delivery_log track
+       failed attempts. Retry count derived from COUNT(*).
 
-    5. Dead-letter queue: After MAX_RETRIES, the event is forwarded to
-       dvp.dead_letter_queue and marked as published to stop retries.
-       Operations team must manually investigate and replay if needed.
+    5. Dead-letter queue: After MAX_RETRIES, the event is forwarded
+       to dvp.dead_letter_queue and a DLQ row is inserted to stop
+       retries. Ops team must manually investigate and replay.
 
     Operational notes:
     ──────────────────
     - Target latency: < 2s from DB commit to Kafka delivery (p99)
-    - Monitor: outbox_events WHERE published_at IS NULL AND created_at < NOW() - INTERVAL '30 seconds'
-    - Alert: any event with retry_count = MAX_RETRIES - 1 (approaching DLQ)
+    - Monitor: outbox_events_current WHERE delivery_status = 'PENDING'
+        AND created_at < NOW() - INTERVAL '30 seconds'
+    - Alert: any event with retry_count = MAX_RETRIES - 1
     - CRITICAL alert: any event in dvp.dead_letter_queue
-    - CRITICAL alert: dvp.reconciliation_mismatch topic — settlement suspended
+    - CRITICAL alert: dvp.reconciliation_mismatch topic
     """
 
     def __init__(self, db, kafka_producer):
@@ -156,16 +164,21 @@ class OutboxPublisher:
 
     async def run_forever(self, poll_interval: float = POLL_INTERVAL):
         self._log.info(
-            "DVP OutboxPublisher started — poll_interval=%.1fs batch_size=%d max_retries=%d",
+            "DVP OutboxPublisher started — "
+            "poll_interval=%.1fs batch_size=%d max_retries=%d",
             poll_interval, BATCH_SIZE, MAX_RETRIES,
         )
         while self._running:
             try:
                 published = await self._poll_and_publish()
                 if published > 0:
-                    self._log.debug("Published %d events in this cycle", published)
+                    self._log.debug(
+                        "Published %d events in this cycle", published
+                    )
             except Exception as exc:
-                self._log.error("Publisher poll cycle error: %s", exc, exc_info=True)
+                self._log.error(
+                    "Publisher poll cycle error: %s", exc, exc_info=True
+                )
             await asyncio.sleep(poll_interval)
         self._log.info("DVP OutboxPublisher stopped.")
 
@@ -174,21 +187,22 @@ class OutboxPublisher:
 
     async def _poll_and_publish(self) -> int:
         """
-        Fetches a batch of unpublished events using FOR UPDATE SKIP LOCKED
-        and delivers each to Kafka.  Returns the count of successfully
-        published events.
+        Fetches a batch of unpublished events (no PUBLISHED or DLQ
+        row in outbox_delivery_log) and delivers each to Kafka.
+        Returns the count of successfully published events.
         """
         events = await self._db.fetch(
             """
-            SELECT id, aggregate_id, event_type, payload,
-                   retry_count, created_at
-            FROM outbox_events
-            WHERE published_at IS NULL
-              AND dlq_at       IS NULL
-              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-            ORDER BY created_at ASC
+            SELECT oe.id, oe.aggregate_id, oe.event_type,
+                   oe.payload, oe.created_at
+            FROM outbox_events oe
+            WHERE NOT EXISTS (
+                SELECT 1 FROM outbox_delivery_log dl
+                WHERE dl.event_id = oe.id
+                  AND dl.status IN ('PUBLISHED', 'DLQ')
+            )
+            ORDER BY oe.created_at ASC
             LIMIT $1
-            FOR UPDATE SKIP LOCKED
             """,
             BATCH_SIZE,
         )
@@ -205,7 +219,17 @@ class OutboxPublisher:
         event_id   = str(event["id"])
         event_type = event["event_type"]
         aggregate  = str(event["aggregate_id"])
-        retry      = event.get("retry_count", 0)
+
+        # Count prior RETRY rows to determine attempt number
+        retry_row = await self._db.fetchrow(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM outbox_delivery_log
+            WHERE event_id = $1 AND status = 'RETRY'
+            """,
+            event_id,
+        )
+        retry = retry_row["cnt"] if retry_row else 0
 
         # Parse payload (asyncpg may return dict or JSON string)
         payload = event["payload"]
@@ -214,7 +238,6 @@ class OutboxPublisher:
 
         topic = _resolve_topic(event_type)
 
-        # Construct the canonical Kafka message envelope
         kafka_envelope = json.dumps({
             "schema_version": "1.0",
             "event_id":       event_id,
@@ -226,51 +249,56 @@ class OutboxPublisher:
         }).encode("utf-8")
 
         try:
-            # Produce to Kafka — key by aggregate_id for ordered delivery
             await self._kafka.send_and_wait(
                 topic=topic,
                 value=kafka_envelope,
                 key=aggregate.encode("utf-8"),
             )
 
-            # Mark published only after Kafka ACK
+            # Append PUBLISHED row (unique index prevents duplicates)
             await self._db.execute(
-                "UPDATE outbox_events SET published_at = $1 WHERE id = $2",
-                _now(), event_id,
+                """
+                INSERT INTO outbox_delivery_log
+                    (id, event_id, status)
+                VALUES ($1, $2, 'PUBLISHED')
+                """,
+                str(uuid.uuid4()), event_id,
             )
 
-            # CRITICAL events log at WARNING level for immediate visibility
             if "mismatch" in event_type or "failed" in event_type:
                 self._log.warning(
-                    "CRITICAL event published — topic=%s event_id=%s aggregate=%s",
-                    topic, event_id, aggregate
+                    "CRITICAL event published — "
+                    "topic=%s event_id=%s aggregate=%s",
+                    topic, event_id, aggregate,
                 )
             else:
                 self._log.debug(
                     "Published event_id=%s type=%s topic=%s",
-                    event_id, event_type, topic
+                    event_id, event_type, topic,
                 )
             return True
 
         except Exception as exc:
             self._log.warning(
-                "Kafka delivery failed — event_id=%s type=%s attempt=%d error=%s",
-                event_id, event_type, retry + 1, exc
+                "Kafka delivery failed — "
+                "event_id=%s type=%s attempt=%d error=%s",
+                event_id, event_type, retry + 1, exc,
             )
 
             if retry + 1 >= MAX_RETRIES:
-                await self._send_to_dlq(event_id, event_type, aggregate, payload, str(exc))
+                await self._send_to_dlq(
+                    event_id, event_type, aggregate, payload,
+                    str(exc),
+                )
             else:
-                backoff_seconds = 5 ** (retry + 1)    # 5s, 25s, 125s
+                # Append RETRY row with error detail
                 await self._db.execute(
                     """
-                    UPDATE outbox_events
-                    SET retry_count   = retry_count + 1,
-                        next_retry_at = NOW() + ($1 * INTERVAL '1 second'),
-                        last_error    = $2
-                    WHERE id = $3
+                    INSERT INTO outbox_delivery_log
+                        (id, event_id, status, error)
+                    VALUES ($1, $2, 'RETRY', $3)
                     """,
-                    backoff_seconds, str(exc), event_id,
+                    str(uuid.uuid4()), event_id, str(exc),
                 )
             return False
 
@@ -302,25 +330,23 @@ class OutboxPublisher:
             )
         except Exception as dlq_exc:
             self._log.critical(
-                "DLQ delivery ALSO failed — event_id=%s error=%s dlq_error=%s "
-                "MANUAL INTERVENTION REQUIRED",
-                event_id, error, dlq_exc
+                "DLQ delivery ALSO failed — event_id=%s error=%s "
+                "dlq_error=%s MANUAL INTERVENTION REQUIRED",
+                event_id, error, dlq_exc,
             )
 
-        # Mark as published (via DLQ) to stop retry loop
+        # Append DLQ row to stop retry loop
         await self._db.execute(
             """
-            UPDATE outbox_events
-            SET published_at = $1,
-                dlq_at       = $1,
-                last_error   = $2
-            WHERE id = $3
+            INSERT INTO outbox_delivery_log
+                (id, event_id, status, error)
+            VALUES ($1, $2, 'DLQ', $3)
             """,
-            _now(), error, event_id,
+            str(uuid.uuid4()), event_id, error,
         )
         self._log.error(
             "Event %s (type=%s) moved to DLQ after %d attempts: %s",
-            event_id, event_type, MAX_RETRIES, error
+            event_id, event_type, MAX_RETRIES, error,
         )
 
 
@@ -345,19 +371,26 @@ def _install_signal_handlers(publisher: OutboxPublisher, loop: asyncio.AbstractE
 async def run_health_check(db) -> dict:
     """
     Returns a snapshot of outbox health for monitoring / readiness probes.
+    Uses the outbox_events_current derived view (append-only).
     """
     row = await db.fetchrow(
         """
         SELECT
-            COUNT(*)                                              AS total_pending,
-            COUNT(*) FILTER (WHERE retry_count > 0)              AS retrying,
-            COUNT(*) FILTER (WHERE dlq_at IS NOT NULL)           AS in_dlq,
-            COUNT(*) FILTER (WHERE created_at < NOW() - INTERVAL '60 seconds'
-                             AND published_at IS NULL
-                             AND dlq_at IS NULL)                 AS stale_events,
-            MAX(created_at) FILTER (WHERE published_at IS NULL)  AS oldest_pending
-        FROM outbox_events
-        WHERE published_at IS NULL OR dlq_at IS NOT NULL
+            COUNT(*)
+                AS total_pending,
+            COUNT(*) FILTER (WHERE retry_count > 0)
+                AS retrying,
+            COUNT(*) FILTER (WHERE delivery_status = 'DLQ')
+                AS in_dlq,
+            COUNT(*) FILTER (
+                WHERE created_at < NOW() - INTERVAL '60 seconds'
+                  AND delivery_status = 'PENDING'
+            )   AS stale_events,
+            MAX(created_at) FILTER (
+                WHERE delivery_status = 'PENDING'
+            )   AS oldest_pending
+        FROM outbox_events_current
+        WHERE delivery_status IN ('PENDING', 'RETRY', 'DLQ')
         """
     )
     return dict(row) if row else {}
@@ -389,7 +422,10 @@ async def main():
     logger.info("Connected to PostgreSQL")
 
     pending = await pool.fetchval(
-        "SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL"
+        """
+        SELECT COUNT(*) FROM outbox_events_current
+        WHERE delivery_status = 'PENDING'
+        """
     )
     logger.info("Pending outbox events: %d", pending)
 

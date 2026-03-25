@@ -1916,8 +1916,8 @@ class DVPOutboxPublisher:
     Async background poller — delivers outbox_events to Kafka reliably.
  
     Design:
-    - Uses FOR UPDATE SKIP LOCKED → safe for multiple publisher replicas
-    - Marks published_at ONLY after successful Kafka delivery
+    - Append-only: delivery state tracked via INSERT into outbox_delivery_log
+    - Inserts PUBLISHED row ONLY after successful Kafka delivery
     - Handles transient Kafka failures with exponential backoff
     - Dead-letter queue (DLQ) after MAX_RETRIES exhausted
  
@@ -2288,14 +2288,15 @@ async def sandbox_demo():
 
     # ── Show outbox events ────────────────────────────────────────────────────
     events = await db.fetch(
-        "SELECT event_type, created_at, published_at "
-        "FROM outbox_events ORDER BY created_at"
+        "SELECT event_type, created_at, delivery_status "
+        "FROM outbox_events_current ORDER BY created_at"
     )
     logger.info("")
     logger.info("Outbox events in database (%d total):", len(events))
     for ev in events:
-        status = "PENDING" if ev["published_at"] is None else "PUBLISHED"
-        logger.info("  %-40s %s", ev["event_type"], status)
+        logger.info(
+            "  %-40s %s", ev["event_type"], ev["delivery_status"]
+        )
     logger.info("")
     logger.info(
         "Run: python3 outbox-publisher.py  "
