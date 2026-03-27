@@ -30,9 +30,12 @@ The system is modeled closely on how institutional settlement infrastructure ope
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| Core Services | `dvp_settlement.py` | All service classes — instruction through reconciliation |
-| Database Schema & Demo | `dvp_settlement.sql` | PostgreSQL schema, indexes, and a full BlackRock → State Street walkthrough |
-| Outbox Publisher | `outbox_publisher.py` | Async background poller — DB outbox → Kafka |
+| Core Services | `dvp-settlement.py` | All service classes — instruction through reconciliation |
+| Database Schema & Demo | `dvp-settlement.sql` | PostgreSQL schema, indexes, and a full BlackRock → State Street walkthrough |
+| Outbox Publisher | `outbox-publisher.py` | Async background poller — DB outbox → Kafka |
+| Docker Compose | `docker-compose.yaml` | 9-service orchestration with trust domain network isolation |
+| DB Schema Init | `db/init/001-schema.sql` | Append-only immutable schema (auto-loaded on first run) |
+| Readonly User | `db/init/002-readonly-user.sql` | Restricted DB user for outbox publisher service |
 
 ---
 
@@ -189,6 +192,18 @@ The `DVPReconciliationEngine` treats any discrepancy as an emergency, not a warn
 ### ✅ Decimal Precision for Financial Arithmetic
 
 All security quantities and monetary values use Python's `Decimal` type rather than floats, preventing IEEE 754 rounding errors from corrupting financial calculations — mandatory in any system handling securities or currency at institutional scale.
+
+### ✅ Automatic Database Creation & Schema Loading
+
+The `ensure_database()` function detects whether the target database exists on startup. If missing, it creates the database and loads every SQL file from `db/init/` in sorted order — applying the full append-only schema and readonly user configuration. No manual `CREATE DATABASE` or `psql -f` step required.
+
+### ✅ Idempotent Demo Data Seeding
+
+The `seed_sandbox_data()` function runs on every startup and idempotently inserts the BlackRock / State Street / BNY Mellon / DTCC entities, custody positions, and initial balances. Every INSERT is guarded by an existence check, so re-runs are safe against the append-only schema.
+
+### ✅ Automatic Kafka Event Publishing
+
+After settlement completes, the sandbox demo automatically connects to Kafka and publishes all pending outbox events. If Kafka is unavailable, events remain in the outbox for later delivery by the standalone `outbox-publisher.py` process. No separate publisher step is required for the demo flow.
 
 ---
 
@@ -372,49 +387,71 @@ The SQL demo models a real institutional DVP trade:
 
 ## 🧪 Running in a Sandbox Environment
 
-### Prerequisites
+### Option A: Docker Compose (Recommended)
 
-- Python 3.10+
-- PostgreSQL 14+
-- Kafka (local or Docker)
+The fastest way to run the entire system. Docker Compose orchestrates all 9 services with trust domain network isolation.
 
-### 1. Clone / Copy the Files
+**Prerequisites:** Docker and Docker Compose.
 
-```
-dvp_settlement.py
-dvp_settlement.sql
-outbox_publisher.py
+```bash
+docker compose up --build
 ```
 
-### 2. Create Virtual Environment
+This starts:
+
+| Service | Description | Network(s) |
+|---------|-------------|------------|
+| `postgres` | PostgreSQL 16 — schema auto-initialized, no host ports | internal |
+| `dvp-service` | Runs full settlement lifecycle (register, fund, settle) | backend, internal |
+| `outbox-publisher` | Polls outbox, delivers to Kafka (readonly_user) | backend, internal |
+| `zookeeper` | Kafka coordination | backend |
+| `kafka` | Event streaming (host port 9092) | backend |
+| `signing-gateway` | HSM/MPC signing gateway (host port 8000) | backend, signing |
+| `mpc-node-1/2/3` | MPC threshold signing nodes | signing |
+
+**Trust domain networks:**
+
+| Network | Type | Purpose |
+|---------|------|---------|
+| `backend` | bridge | Inter-service communication |
+| `internal` | internal | Database access — not reachable from host |
+| `signing` | internal | MPC operations — isolated from DB and host |
+
+PostgreSQL has no host ports exposed — only dvp-service and outbox-publisher can reach it. MPC nodes are unreachable from anything except the signing gateway.
+
+**View logs:**
+
+```bash
+docker compose logs -f dvp-service       # Settlement lifecycle
+docker compose logs -f outbox-publisher   # Kafka delivery
+docker compose logs -f signing-gateway    # Signing requests
+```
+
+**Tear down:**
+
+```bash
+docker compose down -v    # Remove containers and volumes
+```
+
+### Option B: Local Development (Manual Setup)
+
+For running directly on your machine without Docker.
+
+#### Prerequisites
+
+- Python 3.13+
+- PostgreSQL 16+ (running locally — the script auto-creates the `dvp` database)
+- Kafka (local or Docker — optional, the script falls back gracefully)
+
+#### 1. Install Dependencies
 
 ```bash
 python3 -m venv venv
-source venv/bin/activate      # macOS/Linux
-venv\Scripts\activate         # Windows
+source venv/bin/activate
+pip install asyncpg aiokafka aiohttp
 ```
 
-### 3. Install Dependencies
-
-```bash
-pip install asyncpg aiokafka asyncio
-```
-
-### 4. Set Up PostgreSQL
-
-```bash
-psql -U postgres -c "CREATE DATABASE dvp_sandbox;"
-psql -U postgres -d dvp_sandbox -f dvp_settlement.sql
-```
-
-The SQL file will:
-- Create all tables and indexes
-- Register BlackRock, State Street, BNY Mellon, and DTCC
-- Initialize custody positions and cash accounts
-- Run the full BlackRock → State Street AAPL DVP settlement lifecycle
-- Print verification queries showing final settled state
-
-### 5. Start Kafka (Docker)
+#### 2. Start Kafka
 
 ```bash
 docker run -d --name kafka \
@@ -423,118 +460,48 @@ docker run -d --name kafka \
   apache/kafka:latest
 ```
 
-### 6. Run the Outbox Publisher
+#### 3. Run the DVP Settlement Service
 
-```python
-import asyncio
-import asyncpg
-from aiokafka import AIOKafkaProducer
-from outbox_publisher import OutboxPublisher
-
-async def main():
-    pool = await asyncpg.create_pool("postgresql://postgres@localhost/dvp_sandbox")
-    producer = AIOKafkaProducer(
-        bootstrap_servers="localhost:9092",
-        enable_idempotence=True,
-        acks="all",
-    )
-    await producer.start()
-    publisher = OutboxPublisher(db=pool, kafka_producer=producer)
-    await publisher.run_forever(poll_interval=1.0)
-
-asyncio.run(main())
+```bash
+python dvp-settlement.py
 ```
 
-### 7. Exercise the DVP Service with Stubs
+The script automatically:
+- Creates the `dvp` database if it does not exist
+- Loads the append-only schema from `db/init/`
+- Seeds demo entities, positions, and balances (idempotent)
+- Runs the full BlackRock → State Street settlement lifecycle
+- Publishes all outbox events to Kafka (falls back gracefully if Kafka is unavailable)
 
-```python
-from decimal import Decimal
-from dvp_settlement import (
-    DVPSettlementService, ComplianceScreeningService,
-    SettlementLegService, EscrowService, MultiSigApprovalService,
-    AtomicSwapExecutor, HybridSettlementGateway, DVPReconciliationEngine,
-    SandboxComplianceProvider, SandboxHSMSigningService, SandboxChainAdapter,
-    SandboxSWIFTGateway, SandboxFedWireGateway, SandboxCLSGateway,
-    SandboxSigningQueue, SecurityType, SettlementRail, MultiSigVote,
-)
+#### 4. Run the Outbox Publisher (optional)
 
-# Wire sandbox stubs
-class StubDB: pass   # Implement with psycopg2 / asyncpg for real usage
+If Kafka was not available during step 3, start it and run the standalone publisher to deliver pending events:
 
-chain         = SandboxChainAdapter()
-compliance    = ComplianceScreeningService(db, SandboxComplianceProvider())
-legs          = SettlementLegService(db, chain)
-escrow        = EscrowService(db, chain)
-multisig      = MultiSigApprovalService(db, SandboxHSMSigningService(), 
-                    required_custodians=["IRVTUS3N", "SBOSUS33"])
-swap          = AtomicSwapExecutor(db, chain, SandboxSigningQueue())
-hybrid        = HybridSettlementGateway(db, SandboxSWIFTGateway(), 
-                    SandboxFedWireGateway(), SandboxCLSGateway())
-recon         = DVPReconciliationEngine(db, chain)
-
-dvp_service = DVPSettlementService(
-    db=db, compliance_service=compliance, leg_service=legs,
-    escrow_service=escrow, multisig_service=multisig,
-    atomic_swap=swap, hybrid_gateway=hybrid,
-    reconciliation_engine=recon,
-    security_escrow_address="0xSECURITY_ESCROW",
-    cash_escrow_address="0xCASH_ESCROW",
-    security_token_address="0xAAPL_TOKEN",
-    cash_token_address="0xUSD_TOKEN",
-)
-
-# Initiate DVP settlement
-instruction = await dvp_service.initiate_settlement(
-    trade_reference="BLK-SST-AAPL-20260320-001",
-    isin="US0378331005",
-    security_type=SecurityType.EQUITY,
-    quantity=Decimal("500000"),
-    price_per_unit=Decimal("195.00"),
-    currency="USD",
-    seller_entity_id="549300BNMGNFKN6LAD61",   # BlackRock LEI
-    buyer_entity_id="571474TGEMMWANRLN572",     # State Street LEI
-    seller_wallet="0xBLACKROCK_WALLET",
-    buyer_wallet="0xSTATESTREET_WALLET",
-    seller_custodian="IRVTUS3N",               # BNY Mellon BIC
-    buyer_custodian="SBOSUS33",               # State Street BIC
-    settlement_rail=SettlementRail.SWIFT,
-    intended_settlement_date="2026-03-20",
-    seller_jurisdiction="United States",
-    buyer_jurisdiction="United States",
-    idempotency_key="DVP-BLK-SST-AAPL-20260320-001",
-)
-
-# Cast multi-sig votes
-await multisig.cast_vote(instruction.id, "IRVTUS3N", "HSM-BNYM-001", MultiSigVote.APPROVE)
-await multisig.cast_vote(instruction.id, "SBOSUS33", "HSM-SST-007",  MultiSigVote.APPROVE)
-await multisig.finalize_quorum(instruction.id)
-
-# Execute atomic swap + reconciliation
-swap_tx_hash = await dvp_service.finalize_settlement(instruction.id)
-print(f"DVP SETTLED — tx={swap_tx_hash}")
+```bash
+python outbox-publisher.py
 ```
 
-### 8. Verify Final State
+#### 5. Verify Final State
 
 ```sql
--- Settlement summary
+-- Settlement summary (uses derived view)
 SELECT trade_reference, status, reconciliation_status,
        quantity AS shares_settled,
        settlement_amount AS usd_notional,
        swap_tx_hash, settled_at
-FROM dvp_instructions;
+FROM dvp_instructions_current;
 
--- Position verification
+-- Position verification (derived from ledger)
 SELECT entity_id, isin, available_quantity, locked_quantity
-FROM custody_positions;
+FROM custody_balances;
 
--- Cash verification  
+-- Cash verification (derived from ledger)
 SELECT entity_id, currency, available_balance, locked_balance
-FROM cash_accounts;
+FROM cash_balances;
 
 -- Kafka event trail
-SELECT event_type, created_at, published_at
-FROM outbox_events ORDER BY created_at;
+SELECT event_type, created_at, delivery_status
+FROM outbox_events_current ORDER BY created_at;
 ```
 
 ---
@@ -542,32 +509,48 @@ FROM outbox_events ORDER BY created_at;
 ## 📁 Project Structure
 
 ```
-DVP-Settlement-Clearing-System-Python/
+DVP-PYTHON/
 │
-├── dvp_settlement.py          # All service classes:
-│                              #   DVPSettlementService (orchestrator)
-│                              #   ComplianceScreeningService
-│                              #   SettlementLegService
-│                              #   EscrowService
-│                              #   MultiSigApprovalService
-│                              #   AtomicSwapExecutor
-│                              #   HybridSettlementGateway (SWIFT/FedWire/CLS)
-│                              #   DVPReconciliationEngine
-│                              #   DVPOutboxPublisher
-│                              #   Abstract interfaces (DB, Chain, HSM, etc.)
-│                              #   Sandbox stubs for local development
+├── dvp-settlement.py              # All service classes — full settlement engine
+│                                  #   DVPSettlementService (orchestrator)
+│                                  #   ComplianceScreeningService
+│                                  #   SettlementLegService / EscrowService
+│                                  #   MultiSigApprovalService / AtomicSwapExecutor
+│                                  #   HybridSettlementGateway (SWIFT/FedWire/CLS)
+│                                  #   DVPReconciliationEngine / DVPOutboxPublisher
+│                                  #   Abstract interfaces + sandbox stubs
 │
-├── dvp_settlement.sql         # PostgreSQL schema + BlackRock→State Street demo
-│                              #   11 tables with indexes and constraints
-│                              #   Full T+0 settlement lifecycle in SQL
-│                              #   10 verification queries
+├── dvp-settlement.sql             # PostgreSQL schema + BlackRock→State Street demo
 │
-└── outbox_publisher.py        # Standalone async outbox → Kafka publisher
-                               #   FOR UPDATE SKIP LOCKED (multi-replica safe)
-                               #   Exponential backoff retry
-                               #   Dead-letter queue
-                               #   13 Kafka topics
-                               #   Health check endpoint
+├── outbox-publisher.py            # Standalone outbox → Kafka publisher
+│
+├── docker-compose.yaml            # 9-service orchestration with trust domain networks
+│
+├── pyproject.toml                 # Python dependency manifest
+│
+├── dvp-service/                   # Containerized DVP settlement service
+│   ├── Dockerfile
+│   └── dvp-service.py             # Entry point: register → fund → settle
+│
+├── outbox/                        # Containerized outbox publisher
+│   ├── Dockerfile
+│   └── outbox-publisher.py        # Env-configured, readonly_user DB access
+│
+├── signing-gateway/               # HSM/MPC signing gateway
+│   ├── Dockerfile
+│   └── gateway.py                 # aiohttp — fans out to MPC nodes, 2-of-3
+│
+├── mpc/                           # MPC threshold signing node
+│   ├── Dockerfile
+│   └── node.py                    # aiohttp — deterministic partial signatures
+│
+├── db/
+│   └── init/
+│       ├── 001-schema.sql         # Full append-only schema (no demo data)
+│       └── 002-readonly-user.sql  # Restricted user for outbox publisher
+│
+├── README.md
+└── LICENSE
 ```
 
 ---

@@ -1,0 +1,149 @@
+services:
+  # ─────────────────────────────────────────────────────────────────────
+  # PostgreSQL — internal network only, no host ports exposed
+  # ─────────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dvp_settlement
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d dvp_settlement"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ─────────────────────────────────────────────────────────────────────
+  # DVP Settlement Service
+  # ─────────────────────────────────────────────────────────────────────
+  dvp-service:
+    build: ./dvp-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: dvp_settlement
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    networks:
+      - backend
+      - internal
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Outbox Publisher — uses readonly_user for least-privilege access
+  # ─────────────────────────────────────────────────────────────────────
+  outbox-publisher:
+    build: ./outbox
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: dvp_settlement
+      DB_USER: readonly_user
+      DB_PASSWORD: readonly_pass
+      KAFKA_BROKER: kafka:29092
+    networks:
+      - backend
+      - internal
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Zookeeper (Kafka dependency)
+  # ─────────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - backend
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Kafka
+  # ─────────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks:
+      - backend
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Signing Gateway — bridges backend and signing networks
+  # ─────────────────────────────────────────────────────────────────────
+  signing-gateway:
+    build: ./signing-gateway
+    depends_on:
+      - mpc-node-1
+      - mpc-node-2
+      - mpc-node-3
+    environment:
+      MPC_NODES: "mpc-node-1:8001,mpc-node-2:8001,mpc-node-3:8001"
+      THRESHOLD: "2"
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    networks:
+      - backend
+      - signing
+
+  # ─────────────────────────────────────────────────────────────────────
+  # MPC Threshold Signing Nodes — signing network only
+  # ─────────────────────────────────────────────────────────────────────
+  mpc-node-1:
+    build: ./mpc
+    environment:
+      NODE_ID: node-1
+      PORT: "8001"
+    networks:
+      - signing
+
+  mpc-node-2:
+    build: ./mpc
+    environment:
+      NODE_ID: node-2
+      PORT: "8001"
+    networks:
+      - signing
+
+  mpc-node-3:
+    build: ./mpc
+    environment:
+      NODE_ID: node-3
+      PORT: "8001"
+    networks:
+      - signing
+
+networks:
+  backend:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+  signing:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:

@@ -44,6 +44,7 @@ import contextlib
 import json
 import logging
 import os
+import pathlib
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -2061,6 +2062,60 @@ async def _init_connection(conn):
     )
 
 
+async def ensure_database(database_url: str) -> None:
+    """Create the target database and load schema if it
+    does not already exist.
+
+    Connects to the maintenance ``postgres`` database,
+    checks for the target DB, creates it when missing,
+    then executes every SQL file in ``db/init/`` in
+    sorted order.
+    """
+    from urllib.parse import urlparse
+
+    parsed_url = urlparse(database_url)
+    db_name = parsed_url.path.lstrip("/")
+    if not db_name:
+        raise ValueError(
+            f"Cannot determine database name from: {database_url}"
+        )
+
+    maint_url = database_url.rsplit("/", 1)[0] + "/postgres"
+    conn = await asyncpg.connect(maint_url)
+    try:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM pg_database WHERE datname = $1",
+            db_name,
+        )
+        if exists:
+            return
+
+        logger.info("Database %r not found — creating it now", db_name)
+        await conn.execute(
+            f'CREATE DATABASE "{db_name}"'
+        )
+        logger.info("Created database %r", db_name)
+    finally:
+        await conn.close()
+
+    init_dir = pathlib.Path(__file__).parent / "db" / "init"
+    if not init_dir.is_dir():
+        logger.warning(
+            "No db/init/ directory found — skipping schema load"
+        )
+        return
+
+    schema_conn = await asyncpg.connect(database_url)
+    try:
+        for sql_file in sorted(init_dir.glob("*.sql")):
+            logger.info("Loading %s", sql_file.name)
+            sql = sql_file.read_text()
+            await schema_conn.execute(sql)
+        logger.info("Schema initialisation complete")
+    finally:
+        await schema_conn.close()
+
+
 class AsyncpgDB(AbstractDB):
     """
     Wraps asyncpg pool, implementing AbstractDB.
@@ -2163,6 +2218,131 @@ class SandboxSigningQueue(AbstractSigningQueue):
  
  
 # ─────────────────────────────────────────────────────────────────────────────
+# Sandbox Seed Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def seed_sandbox_data(db: AbstractDB) -> None:
+    """Idempotently insert demo entities, positions, and balances.
+
+    Mirrors the seed block in dvp-settlement.sql (sections A-C).
+    Every INSERT is guarded by an existence check so re-runs are
+    safe against the append-only schema.
+    """
+    seller_lei = "549300BNMGNFKN6LAD61"
+    buyer_lei = "571474TGEMMWANRLN572"
+    isin = "US0378331005"
+    currency = "USD"
+
+    # -- A. Register institutional participants --
+    entities = [
+        ("BlackRock, Inc.", seller_lei,
+         "ASSET_MANAGER", "United States", "SEC", "BLRKUS33"),
+        ("State Street Bank and Trust Company", buyer_lei,
+         "CUSTODIAN", "United States", "OCC / FRB", "SBOSUS33"),
+        ("The Bank of New York Mellon", "WFLLPEPC7FZXENRZV498",
+         "CUSTODIAN", "United States", "FRB / OCC", "IRVTUS3N"),
+        ("Depository Trust & Clearing Corporation",
+         "213800ZBKL9BHSL2K459",
+         "CCP", "United States", "SEC / CFTC", "DTCCUS3N"),
+    ]
+    for name, lei, etype, juris, reg, bic in entities:
+        exists = await db.fetchrow(
+            "SELECT 1 FROM registered_entities WHERE lei = $1",
+            lei,
+        )
+        if not exists:
+            await db.execute(
+                "INSERT INTO registered_entities "
+                "(id, entity_name, lei, entity_type, "
+                "jurisdiction, regulator, bic) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                _new_id(), name, lei, etype, juris, reg, bic,
+            )
+
+    # -- B. Custody positions (metadata rows) --
+    for lei, wallet in [
+        (seller_lei, "0xBLACKROCK_WALLET_ADDRESS"),
+        (buyer_lei, "0xSTATESTREET_WALLET_ADDRESS"),
+    ]:
+        exists = await db.fetchrow(
+            "SELECT 1 FROM custody_positions "
+            "WHERE entity_id = $1 AND isin = $2",
+            lei, isin,
+        )
+        if not exists:
+            await db.execute(
+                "INSERT INTO custody_positions "
+                "(id, entity_id, isin, cusip, "
+                "security_description, token_address, "
+                "wallet_address, custodian) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                _new_id(), lei, isin, "037833100",
+                "Apple Inc. Common Stock",
+                "0xAAPL_TOKEN_CONTRACT_ADDRESS",
+                wallet, "DTC",
+            )
+
+    # -- Initial security balance for seller --
+    bal = await db.fetchrow(
+        "SELECT available_quantity FROM custody_balances "
+        "WHERE entity_id = $1 AND isin = $2",
+        seller_lei, isin,
+    )
+    if not bal or Decimal(str(bal["available_quantity"])) == 0:
+        await db.execute(
+            "INSERT INTO security_ledger "
+            "(entity_id, isin, pool, amount, reason) "
+            "VALUES ($1,$2,'AVAILABLE',$3,'INITIAL_BALANCE')",
+            seller_lei, isin, Decimal("2000000"),
+        )
+
+    # -- C. Cash accounts (metadata rows) --
+    cash_accounts_data = [
+        (buyer_lei, currency, "TOKENIZED_CASH",
+         "011000028", "SBOSUS33"),
+        (seller_lei, currency, "TOKENIZED_CASH",
+         "021000018", "BLRKUS33"),
+    ]
+    for lei, cur, acct_type, aba, bic in cash_accounts_data:
+        exists = await db.fetchrow(
+            "SELECT 1 FROM cash_accounts "
+            "WHERE entity_id = $1 AND currency = $2",
+            lei, cur,
+        )
+        if not exists:
+            await db.execute(
+                "INSERT INTO cash_accounts "
+                "(id, entity_id, currency, account_type, "
+                "bank_aba, swift_bic) "
+                "VALUES ($1,$2,$3,$4,$5,$6)",
+                _new_id(), lei, cur, acct_type, aba, bic,
+            )
+
+    # -- Initial cash balances --
+    for lei, amount in [
+        (buyer_lei, Decimal("500000000.00")),
+        (seller_lei, Decimal("10000000.00")),
+    ]:
+        cash_bal = await db.fetchrow(
+            "SELECT available_balance FROM cash_balances "
+            "WHERE entity_id = $1 AND currency = $2",
+            lei, currency,
+        )
+        if not cash_bal or Decimal(str(
+            cash_bal["available_balance"]
+        )) == 0:
+            await db.execute(
+                "INSERT INTO cash_ledger "
+                "(entity_id, currency, pool, amount, reason) "
+                "VALUES ($1,$2,'AVAILABLE',$3,"
+                "'INITIAL_BALANCE')",
+                lei, currency, amount,
+            )
+
+    logger.info("Sandbox seed data ready")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sandbox Entrypoint — Illustrative Usage
 # ─────────────────────────────────────────────────────────────────────────────
  
@@ -2170,8 +2350,8 @@ async def sandbox_demo():
     """
     Runs the full DVP settlement flow against a real PostgreSQL database.
     External services (SWIFT, FedWire, CLS, HSM, chain) use sandbox stubs.
-    Outbox events are written to outbox_events for Kafka delivery
-    by the separate outbox-publisher.py process.
+    Outbox events are written to the database and automatically published
+    to Kafka. Falls back to manual delivery if Kafka is unavailable.
 
     Scenario: BlackRock sells 100,000 AAPL shares to State Street
     at $195/share = $19,500,000 USD via SWIFT + on-chain atomic swap.
@@ -2185,8 +2365,9 @@ async def sandbox_demo():
 
     # ── Connect to PostgreSQL ─────────────────────────────────────────────────────
     database_url = os.getenv(
-        "DATABASE_URL", "postgresql://postgres@localhost/dvp_sandbox"
+        "DATABASE_URL", "postgresql://postgres@localhost/dvp"
     )
+    await ensure_database(database_url)
     pool = await asyncpg.create_pool(
         database_url, min_size=2, max_size=5, init=_init_connection,
     )
@@ -2194,6 +2375,9 @@ async def sandbox_demo():
     logger.info(
         "Connected to PostgreSQL — %s", database_url.split("@")[-1]
     )
+
+    # ── Seed demo data (idempotent) ────────────────────────────────────────
+    await seed_sandbox_data(db)
 
     # ── Wire services (real DB + sandbox external stubs) ──────────────────
     compliance_svc = ComplianceScreeningService(
@@ -2297,13 +2481,51 @@ async def sandbox_demo():
         logger.info(
             "  %-40s %s", ev["event_type"], ev["delivery_status"]
         )
-    logger.info("")
-    logger.info(
-        "Run: python3 outbox-publisher.py  "
-        "to deliver these events to Kafka"
-    )
-    logger.info("=" * 70)
+    # ── Auto-publish outbox events to Kafka ──────────────────────────────
+    kafka_brokers = os.getenv("KAFKA_BROKERS", "localhost:9092")
+    try:
+        from aiokafka import AIOKafkaProducer
 
+        kafka_producer = AIOKafkaProducer(
+            bootstrap_servers=kafka_brokers,
+            enable_idempotence=True,
+            acks="all",
+            compression_type="lz4",
+            max_batch_size=16384,
+            linger_ms=5,
+        )
+        await asyncio.wait_for(kafka_producer.start(), timeout=10)
+        logger.info("Connected to Kafka at %s", kafka_brokers)
+
+        publisher = DVPOutboxPublisher(db=db, kafka_producer=kafka_producer)
+        await publisher._poll_and_publish()
+
+        published = await db.fetch(
+            "SELECT event_type, delivery_status "
+            "FROM outbox_events_current ORDER BY created_at"
+        )
+        logger.info("")
+        logger.info(
+            "Outbox events published to Kafka (%d total):",
+            len(published),
+        )
+        for ev in published:
+            logger.info(
+                "  %-40s %s",
+                ev["event_type"],
+                ev["delivery_status"],
+            )
+
+        await kafka_producer.stop()
+    except Exception as exc:
+        logger.warning(
+            "Could not auto-publish to Kafka (%s). "
+            "Run: python3 outbox-publisher.py  "
+            "to deliver events manually",
+            exc,
+        )
+
+    logger.info("=" * 70)
     await pool.close()
 
 
