@@ -947,14 +947,15 @@ class SettlementLegService:
         )
         return security_leg, cash_leg
  
-    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict):
+    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict, ctx=None):
+        audit = ctx.as_sql_args() if ctx else (None, None, None, None)
         await self._db.execute(
-            """
-            INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
-            VALUES ($1, $2, $3, $4, $5)
-            """,
+            "INSERT INTO outbox_events "
+            "(id, aggregate_id, event_type, payload, "
+            "request_id, trace_id, actor, actor_role, created_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             _new_id(), instruction_id, event_type,
-            json.dumps(payload), _now(),
+            json.dumps(payload), *audit, _now(),
         )
  
  
@@ -1168,10 +1169,15 @@ class EscrowService:
             )
         self._log.warning("Escrow released for %s — reason: %s", instruction_id, reason)
  
-    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict):
+    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict, ctx=None):
+        audit = ctx.as_sql_args() if ctx else (None, None, None, None)
         await self._db.execute(
-            "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
-            _new_id(), instruction_id, event_type, json.dumps(payload), _now(),
+            "INSERT INTO outbox_events "
+            "(id, aggregate_id, event_type, payload, "
+            "request_id, trace_id, actor, actor_role, created_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            _new_id(), instruction_id, event_type,
+            json.dumps(payload), *audit, _now(),
         )
  
  
@@ -1353,10 +1359,15 @@ class MultiSigApprovalService:
             )
         self._log.info("Multi-sig quorum reached for instruction %s", instruction_id)
  
-    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict):
+    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict, ctx=None):
+        audit = ctx.as_sql_args() if ctx else (None, None, None, None)
         await self._db.execute(
-            "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
-            _new_id(), instruction_id, event_type, json.dumps(payload), _now(),
+            "INSERT INTO outbox_events "
+            "(id, aggregate_id, event_type, payload, "
+            "request_id, trace_id, actor, actor_role, created_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            _new_id(), instruction_id, event_type,
+            json.dumps(payload), *audit, _now(),
         )
  
  
@@ -1617,10 +1628,15 @@ class AtomicSwapExecutor:
             )
         self._log.error("Atomic swap FAILED for instruction %s: %s", instruction_id, reason)
  
-    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict):
+    async def _write_outbox_event(self, instruction_id: str, event_type: str, payload: dict, ctx=None):
+        audit = ctx.as_sql_args() if ctx else (None, None, None, None)
         await self._db.execute(
-            "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
-            _new_id(), instruction_id, event_type, json.dumps(payload), _now(),
+            "INSERT INTO outbox_events "
+            "(id, aggregate_id, event_type, payload, "
+            "request_id, trace_id, actor, actor_role, created_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            _new_id(), instruction_id, event_type,
+            json.dumps(payload), *audit, _now(),
         )
  
  
