@@ -46,6 +46,7 @@ import json
 import logging
 import os
 import pathlib
+import sys
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -76,10 +77,90 @@ class StructuredFormatter(logging.Formatter):
         return json.dumps(log_entry)
 
 
-_handler = logging.StreamHandler()
-_handler.setFormatter(StructuredFormatter())
+# ANSI color codes
+_C_RESET   = "\033[0m"
+_C_BOLD    = "\033[1m"
+_C_DIM     = "\033[2m"
+_C_GREEN   = "\033[32m"
+_C_YELLOW  = "\033[33m"
+_C_RED     = "\033[31m"
+_C_CYAN    = "\033[36m"
+_C_MAGENTA = "\033[35m"
+_C_WHITE   = "\033[97m"
+_C_BG_RED  = "\033[41m"
+
+_LOGGER_LABELS = {
+    "dvp_settlement":       "",
+    "dvp.orchestrator":     "ORCHESTRATOR",
+    "dvp.compliance":       "COMPLIANCE",
+    "dvp.legs":             "LEGS",
+    "dvp.escrow":           "ESCROW",
+    "dvp.multisig":         "MULTISIG",
+    "dvp.atomic_swap":      "ATOMIC SWAP",
+    "dvp.hybrid_rail":      "HYBRID RAIL",
+    "dvp.reconciliation":   "RECONCILIATION",
+    "dvp.outbox_publisher": "OUTBOX",
+}
+
+_LEVEL_STYLES = {
+    "DEBUG":    (_C_DIM, "DBG"),
+    "INFO":     (_C_GREEN, "OK "),
+    "WARNING":  (_C_YELLOW, "WRN"),
+    "ERROR":    (_C_RED, "ERR"),
+    "CRITICAL": (f"{_C_BG_RED}{_C_WHITE}", "CRT"),
+}
+
+
+class DemoFormatter(logging.Formatter):
+    """Colorized, human-readable output for the sandbox demo."""
+
+    def format(self, record):
+        msg = record.getMessage()
+        if not msg:
+            return ""
+
+        color, tag = _LEVEL_STYLES.get(
+            record.levelname, (_C_RESET, "???"),
+        )
+        label = _LOGGER_LABELS.get(record.name, record.name)
+
+        if label:
+            prefix = (
+                f"{color}{tag}{_C_RESET}"
+                f" {_C_CYAN}{label:<15}{_C_RESET}"
+            )
+        else:
+            prefix = f"{color}{tag}{_C_RESET} "
+
+        # Highlight key=value pairs in the message
+        parts = []
+        for segment in msg.split(" "):
+            if "=" in segment and not segment.startswith("="):
+                k, _, v = segment.partition("=")
+                parts.append(
+                    f"{_C_DIM}{k}={_C_RESET}"
+                    f"{_C_MAGENTA}{v}{_C_RESET}"
+                )
+            else:
+                parts.append(segment)
+        styled_msg = " ".join(parts)
+
+        return f"  {prefix} {styled_msg}"
+
+
+_use_demo_formatter = os.getenv("DVP_LOG_FORMAT", "demo") == "demo"
+_handler = logging.StreamHandler(
+    sys.stdout if _use_demo_formatter else sys.stderr,
+)
+_handler.setFormatter(
+    DemoFormatter() if _use_demo_formatter else StructuredFormatter(),
+)
 logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger("dvp_settlement")
+
+# Suppress noisy Kafka topic auto-creation warnings in demo mode
+if _use_demo_formatter:
+    logging.getLogger("aiokafka").setLevel(logging.ERROR)
  
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3108,6 +3189,50 @@ async def seed_sandbox_data(db: AbstractDB) -> None:
 # Sandbox Entrypoint — Illustrative Usage
 # ─────────────────────────────────────────────────────────────────────────────
  
+def _banner(title, subtitle=""):
+    """Print a colorized section banner to stdout."""
+    w = 70
+    print(f"\n{_C_CYAN}{_C_BOLD}{'=' * w}{_C_RESET}")
+    print(f"{_C_CYAN}{_C_BOLD}  {title}{_C_RESET}")
+    if subtitle:
+        print(f"{_C_DIM}  {subtitle}{_C_RESET}")
+    print(f"{_C_CYAN}{_C_BOLD}{'=' * w}{_C_RESET}\n")
+
+
+def _section(title):
+    """Print a colorized sub-section header to stdout."""
+    print(f"\n{_C_CYAN}  --- {title} {'-' * max(1, 56 - len(title))}{_C_RESET}")
+
+
+def _status_color(status):
+    """Return ANSI color for an event delivery status."""
+    if status == "PUBLISHED":
+        return _C_GREEN
+    if status == "PENDING":
+        return _C_YELLOW
+    if status in ("FAILED", "DLQ"):
+        return _C_RED
+    return _C_RESET
+
+
+def _print_event_table(events, show_total=False):
+    """Print outbox events as a compact colorized table."""
+    if show_total:
+        print(
+            f"  {_C_DIM}{len(events)} events{_C_RESET}\n"
+        )
+    print(
+        f"  {_C_BOLD}{'Event':<42} {'Status':<12}{_C_RESET}"
+    )
+    print(f"  {_C_DIM}{'-' * 54}{_C_RESET}")
+    for ev in events:
+        etype = ev["event_type"]
+        status = ev["delivery_status"]
+        sc = _status_color(status)
+        print(f"  {etype:<42} {sc}{status:<12}{_C_RESET}")
+    print()
+
+
 async def sandbox_demo():
     """
     Runs the full DVP settlement flow against a real PostgreSQL database.
@@ -3118,14 +3243,13 @@ async def sandbox_demo():
     Scenario: BlackRock sells 100,000 AAPL shares to State Street
     at $195/share = $19,500,000 USD via SWIFT + on-chain atomic swap.
     """
-    logger.info("=" * 70)
-    logger.info("DVP Settlement & Clearing System — Live Sandbox Demo")
-    logger.info(
-        "Scenario: BlackRock 100K AAPL → State Street | $19.5M USD"
+    _banner(
+        "DVP Settlement & Clearing System — Live Sandbox Demo",
+        "Scenario: BlackRock 100K AAPL -> State Street | $19.5M USD",
     )
-    logger.info("=" * 70)
 
-    # ── Connect to PostgreSQL ─────────────────────────────────────────────────────
+    _section("Infrastructure")
+
     database_url = os.getenv(
         "DATABASE_URL", "postgresql://postgres@localhost/dvp"
     )
@@ -3138,11 +3262,8 @@ async def sandbox_demo():
         "Connected to PostgreSQL — %s", database_url.split("@")[-1]
     )
 
-    # ── Seed demo data (idempotent) ────────────────────────────────────────
     await seed_sandbox_data(db)
 
-    # ── Wire services (real DB + sandbox external stubs) ──────────────────
-    # ── RBAC checker (shared across all services) ──
     rbac = RBACChecker(db)
 
     compliance_svc = ComplianceScreeningService(
@@ -3184,15 +3305,14 @@ async def sandbox_demo():
     )
     logger.info("All services wired (real DB + RBAC + sandbox stubs)")
 
-    # ── Audit contexts ──
     trace_id = str(uuid.uuid4())
     system_ctx = AuditContext.for_actor(
         "SYSTEM/sandbox", "SYSTEM", trace_id,
     )
 
-    # ── Execute full settlement flow ──────────────────────────────────────────
+    _section("Settlement Flow")
+
     try:
-        # Steps 1-6: initiate → compliance → lock legs → escrow → SWIFT
         instruction = await dvp_svc.initiate_settlement(
             trade_reference="BLK-SST-AAPL-LIVE-001",
             isin="US0378331005",
@@ -3217,8 +3337,8 @@ async def sandbox_demo():
             "Instruction %s at MULTISIG_PENDING", instruction.id
         )
 
-        # Step 7: Cast multi-sig votes (2-of-3 quorum)
-        # Per-custodian audit contexts (different actors)
+        _section("Multi-Sig Approval (2-of-3 quorum)")
+
         bnym_ctx = AuditContext.for_actor(
             "IRVTUS3N", "CUSTODIAN", trace_id,
         )
@@ -3243,7 +3363,8 @@ async def sandbox_demo():
             )
             logger.info("Multi-sig quorum reached")
 
-        # Steps 8-9: Atomic swap + reconciliation
+        _section("Atomic Swap & Reconciliation")
+
         try:
             swap_tx = await dvp_svc.finalize_settlement(
                 instruction.id, ctx=system_ctx,
@@ -3259,18 +3380,16 @@ async def sandbox_demo():
     except DVPSettlementError as exc:
         logger.error("Settlement failed: %s", exc)
 
-    # ── Show outbox events ────────────────────────────────────────────────────
+    _section("Outbox Events (database)")
+
     events = await db.fetch(
         "SELECT event_type, created_at, delivery_status "
         "FROM outbox_events_current ORDER BY created_at"
     )
-    logger.info("")
-    logger.info("Outbox events in database (%d total):", len(events))
-    for ev in events:
-        logger.info(
-            "  %-40s %s", ev["event_type"], ev["delivery_status"]
-        )
-    # ── Auto-publish outbox events to Kafka ──────────────────────────────
+    _print_event_table(events, show_total=True)
+
+    _section("Kafka Publishing")
+
     kafka_brokers = os.getenv("KAFKA_BROKERS", "localhost:9092")
     try:
         from aiokafka import AIOKafkaProducer
@@ -3286,24 +3405,16 @@ async def sandbox_demo():
         await asyncio.wait_for(kafka_producer.start(), timeout=10)
         logger.info("Connected to Kafka at %s", kafka_brokers)
 
-        publisher = DVPOutboxPublisher(db=db, kafka_producer=kafka_producer)
+        publisher = DVPOutboxPublisher(
+            db=db, kafka_producer=kafka_producer,
+        )
         await publisher._poll_and_publish()
 
         published = await db.fetch(
             "SELECT event_type, delivery_status "
             "FROM outbox_events_current ORDER BY created_at"
         )
-        logger.info("")
-        logger.info(
-            "Outbox events published to Kafka (%d total):",
-            len(published),
-        )
-        for ev in published:
-            logger.info(
-                "  %-40s %s",
-                ev["event_type"],
-                ev["delivery_status"],
-            )
+        _print_event_table(published, show_total=True)
 
         await kafka_producer.stop()
     except Exception as exc:
@@ -3314,7 +3425,7 @@ async def sandbox_demo():
             exc,
         )
 
-    logger.info("=" * 70)
+    _banner("Done")
     await pool.close()
 
 

@@ -24,7 +24,7 @@
 
 ## 📖 Overview
 
-The **Institutional DVP Settlement & Clearing System** is a Python-based reference implementation that models the full lifecycle of a **Delivery vs. Payment (DVP)** settlement instruction — from initial instruction creation through compliance screening, leg locking, escrow funding, multi-sig authorization, atomic swap execution, hybrid payment rail messaging (SWIFT / FedWire / CLS), and post-settlement reconciliation.
+The **Institutional DVP Settlement & Clearing System** is a Python-based reference implementation that models the full lifecycle of a **Delivery vs. Payment (DVP)** settlement instruction — from initial instruction creation through compliance screening, leg locking, escrow funding, multi-sig authorization, atomic swap execution, hybrid payment rail messaging (SWIFT / FedWire / CLS), and post-settlement reconciliation. Every operation is protected by **role-based access control (RBAC)** and recorded in an **append-only audit trail** with full request/trace lineage.
 
 The system is modeled closely on how institutional settlement infrastructure operates at **JPMorgan Onyx**, **DTCC Project Ion**, **CLS (Continuous Linked Settlement)**, and **Euroclear**. It demonstrates how traditional financial infrastructure (SWIFT, FedWire, custodian systems) integrates with distributed ledger technology (tokenized securities, tokenized cash, atomic swaps) to achieve T+0 finality while eliminating counterparty risk.
 
@@ -34,7 +34,7 @@ The system is modeled closely on how institutional settlement infrastructure ope
 | Database Schema & Demo | `dvp-settlement.sql` | PostgreSQL schema, indexes, and a full BlackRock → State Street walkthrough |
 | Outbox Publisher | `outbox-publisher.py` | Async background poller — DB outbox → Kafka |
 | Docker Compose | `docker-compose.yaml` | 9-service orchestration with trust domain network isolation |
-| DB Schema Init | `db/init/001-schema.sql` | Append-only immutable schema (auto-loaded on first run) |
+| DB Schema Init | `db/init/001-schema.sql` | Append-only immutable schema + RBAC tables + audit log (auto-loaded on first run) |
 | Readonly User | `db/init/002-readonly-user.sql` | Restricted DB user for outbox publisher service |
 
 ---
@@ -50,7 +50,7 @@ DVP is the backbone of:
 - **Cross-border FX settlement** (CLS eliminates Herstatt risk)
 - **Central bank digital currency (CBDC) settlement pilots**
 
-This system implements DVP at the institutional level — handling the full complexity of multi-custodian coordination, payment rail messaging, HSM-based multi-sig authorization, and 4-source post-settlement reconciliation.
+This system implements DVP at the institutional level — handling the full complexity of multi-custodian coordination, payment rail messaging, HSM-based multi-sig authorization, RBAC-enforced access control with separation of duties, end-to-end audit trails, and 4-source post-settlement reconciliation.
 
 ---
 
@@ -119,7 +119,7 @@ This system implements DVP at the institutional level — handling the full comp
 
 ### `DVPSettlementService`
 
-The master orchestrator. Coordinates all sub-services in strict sequence, enforces state machine integrity, and provides the single entry point for initiating and finalizing DVP settlement instructions. Handles the full unwind path on failures at any stage.
+The master orchestrator. Coordinates all sub-services in strict sequence, enforces state machine integrity, and provides the single entry point for initiating and finalizing DVP settlement instructions. Every call requires an `AuditContext` (request_id, trace_id, actor, actor_role) and passes through RBAC permission checks before execution. Handles the full unwind path on failures at any stage.
 
 ### `ComplianceScreeningService`
 
@@ -135,7 +135,7 @@ Manages the dual on-chain escrow accounts that are the physical manifestation of
 
 ### `MultiSigApprovalService`
 
-Manages custodian approval votes for atomic swap authorization. Default quorum: 2-of-3 (both custodians required; CCP optional). HSM signatures are generated **outside** the DB transaction. Prevents double-voting via a unique constraint on `(instruction_id, custodian_id)`. The atomic swap cannot execute until `check_quorum()` returns `True`.
+Manages custodian approval votes for atomic swap authorization. Default quorum: 2-of-3 (both custodians required; CCP optional). HSM signatures are generated **outside** the DB transaction. Prevents double-voting via a unique constraint on `(instruction_id, custodian_id)`. Enforces **separation of duties** — the actor who initiated the instruction cannot also vote on it. The atomic swap cannot execute until `check_quorum()` returns `True`.
 
 ### `AtomicSwapExecutor`
 
@@ -152,6 +152,14 @@ Post-settlement 4-source reconciliation engine. Checks: (1) internal ledger vs o
 ### `DVPOutboxPublisher`
 
 Standalone async background process. Polls `outbox_events` with `FOR UPDATE SKIP LOCKED` for safe multi-replica deployment. Delivers events to Kafka with exponential backoff retry (5s → 25s → 125s). After `MAX_RETRIES`, events are forwarded to `dvp.dead_letter_queue` and flagged for manual intervention.
+
+### `AuditContext`
+
+Immutable dataclass threaded through every service call. Carries `request_id`, `trace_id`, `actor`, and `actor_role`. Every database write includes these four fields, creating an unbroken audit chain from API entry point to ledger mutation. Factory methods `AuditContext.system()` and `AuditContext.for_actor()` create contexts for system operations and human/custodian actors respectively.
+
+### `RBACChecker`
+
+Loads and caches per-actor permissions from the `rbac_actor_roles` / `rbac_role_permissions` join. The `@require_permission` decorator enforces RBAC before any service method executes — if the actor's role lacks the required permission, an `AuthorizationError` is raised before any side effect occurs. Permissions are cached per-actor for the lifetime of the request.
 
 ---
 
@@ -204,6 +212,22 @@ The `seed_sandbox_data()` function runs on every startup and idempotently insert
 ### ✅ Automatic Kafka Event Publishing
 
 After settlement completes, the sandbox demo automatically connects to Kafka and publishes all pending outbox events. If Kafka is unavailable, events remain in the outbox for later delivery by the standalone `outbox-publisher.py` process. No separate publisher step is required for the demo flow.
+
+### ✅ Role-Based Access Control (RBAC)
+
+Every service method is gated by a `@require_permission` decorator that checks the caller's permissions before any side effect. Six pre-seeded roles — `ADMIN`, `ORIGINATOR`, `CUSTODIAN`, `COMPLIANCE_OFFICER`, `SYSTEM`, and `SIGNING_AGENT` — map to granular permissions (`settlement.initiate`, `multisig.vote`, `compliance.screen`, `escrow.fund`, etc.). Roles, permissions, and actor assignments are stored in append-only RBAC tables with mutation triggers that prevent UPDATE/DELETE.
+
+### ✅ End-to-End Audit Trail
+
+Every database write across all services includes `request_id`, `trace_id`, `actor`, and `actor_role` columns. A dedicated `audit_log` table records every operation with the affected resource and detail payload. The `trace_id` links all operations within a single settlement flow, while `request_id` identifies individual service calls — enabling full reconstruction of who did what, when, and why.
+
+### ✅ Separation of Duties
+
+The `MultiSigApprovalService` enforces that the actor who initiated a settlement instruction cannot also cast a vote on it. This prevents a single compromised or malicious actor from both originating and approving a trade — a fundamental institutional control required by custodian compliance frameworks.
+
+### ✅ Colorized Demo Output
+
+The sandbox demo uses a `DemoFormatter` that renders human-readable, colorized terminal output with section banners, service-tagged log lines, key=value highlighting, and formatted event tables. Toggle between demo and structured JSON output via the `DVP_LOG_FORMAT` environment variable (`demo` for colorized, `json` for structured). Noisy Kafka topic auto-creation warnings are suppressed in demo mode.
 
 ---
 
@@ -295,6 +319,48 @@ Reliable Kafka delivery buffer.
 | `published_at` | TIMESTAMP | NULL = pending Kafka delivery |
 | `retry_count` | INT | Delivery attempt count |
 | `dlq_at` | TIMESTAMP | NULL = not dead-lettered |
+
+### `audit_log`
+
+Append-only audit trail for all operations.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `request_id` | UUID | Unique ID per service call |
+| `trace_id` | UUID | Shared across all calls in one settlement flow |
+| `actor` | VARCHAR(256) | Who performed the operation (LEI, BIC, or SYSTEM/*) |
+| `actor_role` | VARCHAR(50) | `SYSTEM`, `CUSTODIAN`, `ORIGINATOR`, etc. |
+| `operation` | VARCHAR(100) | e.g. `settlement.initiate`, `multisig.vote` |
+| `resource` | VARCHAR(256) | Affected resource ID (instruction, leg, escrow) |
+| `detail` | JSONB | Operation-specific payload |
+
+### `rbac_roles`
+
+Named roles for access control.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `role_name` | VARCHAR(50) UNIQUE | `ADMIN`, `ORIGINATOR`, `CUSTODIAN`, `COMPLIANCE_OFFICER`, `SYSTEM`, `SIGNING_AGENT` |
+| `description` | TEXT | Human-readable role description |
+
+### `rbac_role_permissions`
+
+Granular permissions assigned to each role.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `role_id` | UUID FK | References `rbac_roles(id)` |
+| `permission` | VARCHAR(100) | e.g. `settlement.initiate`, `multisig.vote`, `*` (wildcard) |
+
+### `rbac_actor_roles`
+
+Maps actors (entities, system accounts) to roles.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `actor` | VARCHAR(256) | Actor identifier (LEI, BIC, or SYSTEM/*) |
+| `role_id` | UUID FK | References `rbac_roles(id)` |
+| `granted_by` | VARCHAR(256) | Who granted this role assignment |
 
 ---
 
@@ -468,10 +534,16 @@ python dvp-settlement.py
 
 The script automatically:
 - Creates the `dvp` database if it does not exist
-- Loads the append-only schema from `db/init/`
-- Seeds demo entities, positions, and balances (idempotent)
-- Runs the full BlackRock → State Street settlement lifecycle
+- Loads the append-only schema from `db/init/` (includes RBAC tables and audit log)
+- Seeds demo entities, positions, balances, and RBAC role assignments (idempotent)
+- Runs the full BlackRock → State Street settlement lifecycle with RBAC enforcement and audit trails
 - Publishes all outbox events to Kafka (falls back gracefully if Kafka is unavailable)
+
+**Output format:** By default, the demo uses colorized terminal output. Set `DVP_LOG_FORMAT=json` for structured JSON logging:
+
+```bash
+DVP_LOG_FORMAT=json python dvp-settlement.py
+```
 
 #### 4. Run the Outbox Publisher (optional)
 
@@ -518,6 +590,7 @@ DVP-PYTHON/
 │                                  #   MultiSigApprovalService / AtomicSwapExecutor
 │                                  #   HybridSettlementGateway (SWIFT/FedWire/CLS)
 │                                  #   DVPReconciliationEngine / DVPOutboxPublisher
+│                                  #   AuditContext / RBACChecker / DemoFormatter
 │                                  #   Abstract interfaces + sandbox stubs
 │
 ├── dvp-settlement.sql             # PostgreSQL schema + BlackRock→State Street demo
@@ -546,7 +619,7 @@ DVP-PYTHON/
 │
 ├── db/
 │   └── init/
-│       ├── 001-schema.sql         # Full append-only schema (no demo data)
+│       ├── 001-schema.sql         # Full append-only schema + RBAC + audit log
 │       └── 002-readonly-user.sql  # Restricted user for outbox publisher
 │
 ├── README.md
@@ -571,7 +644,7 @@ DVP-PYTHON/
 | AML / KYC provider integration (ComplyAdvantage) | No actual sanctions screening |
 | Securities regulations compliance (SEC Rule 15c6) | Potential regulatory violations |
 | Central bank / CCP connectivity | Cannot connect to Fed / ECB settlement systems |
-| Authentication & authorization | Any caller can initiate billion-dollar settlements |
+| Production authentication (OAuth / mTLS / API keys) | RBAC is enforced but actors are not authenticated against an identity provider |
 | Rate limiting & position limits | No controls on settlement size |
 | Comprehensive test suite | Untested edge cases in fund handling |
 | Dead-letter queue manual replay tooling | Failed events require developer intervention |
