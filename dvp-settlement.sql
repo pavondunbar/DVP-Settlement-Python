@@ -32,6 +32,10 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";   -- uuid_generate_v4()
 -- Drop (for sandbox re-runs)
 -- ─────────────────────────────────────────────────────────────────────────────
 
+DROP TABLE IF EXISTS rbac_actor_roles CASCADE;
+DROP TABLE IF EXISTS rbac_role_permissions CASCADE;
+DROP TABLE IF EXISTS rbac_roles CASCADE;
+DROP TABLE IF EXISTS audit_log CASCADE;
 DROP VIEW  IF EXISTS outbox_events_current          CASCADE;
 DROP VIEW  IF EXISTS hybrid_rail_messages_current    CASCADE;
 DROP VIEW  IF EXISTS escrow_accounts_current         CASCADE;
@@ -39,6 +43,7 @@ DROP VIEW  IF EXISTS settlement_legs_current         CASCADE;
 DROP VIEW  IF EXISTS dvp_instructions_current        CASCADE;
 DROP VIEW  IF EXISTS cash_balances                   CASCADE;
 DROP VIEW  IF EXISTS custody_balances                CASCADE;
+DROP TABLE IF EXISTS consumed_events                 CASCADE;
 DROP TABLE IF EXISTS outbox_delivery_log             CASCADE;
 DROP TABLE IF EXISTS reconciliation_reports          CASCADE;
 DROP TABLE IF EXISTS hybrid_rail_message_events      CASCADE;
@@ -180,6 +185,10 @@ CREATE TABLE security_ledger (
     amount          DECIMAL(38,10)  NOT NULL,
     instruction_id  UUID,
     reason          VARCHAR(50)     NOT NULL,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_sec_pool CHECK (pool IN ('AVAILABLE','LOCKED'))
 );
@@ -212,6 +221,10 @@ CREATE TABLE cash_ledger (
     amount          DECIMAL(38,2)   NOT NULL,
     instruction_id  UUID,
     reason          VARCHAR(50)     NOT NULL,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_cash_pool CHECK (pool IN ('AVAILABLE','LOCKED'))
 );
@@ -333,6 +346,10 @@ CREATE TABLE dvp_instructions (
     settlement_rail          VARCHAR(20)     NOT NULL,
     intended_settlement_date DATE            NOT NULL,
     idempotency_key          VARCHAR(256)    NOT NULL UNIQUE,
+    request_id               UUID,
+    trace_id                 UUID,
+    actor                    VARCHAR(256),
+    actor_role               VARCHAR(50),
     created_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_quantity          CHECK (quantity          > 0),
@@ -369,13 +386,17 @@ CREATE TABLE dvp_instruction_events (
     swap_tx_hash          VARCHAR(256),
     failure_reason        TEXT,
     reconciliation_status VARCHAR(20),
+    request_id            UUID,
+    trace_id              UUID,
+    actor                 VARCHAR(256),
+    actor_role            VARCHAR(50),
     created_at            TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_event_status CHECK (
         status IS NULL OR status IN (
-            'INITIATED', 'COMPLIANCE_CHECK', 'LEGS_LOCKED', 'ESCROW_FUNDED',
-            'MULTISIG_PENDING', 'MULTISIG_APPROVED', 'ATOMIC_SWAP',
-            'SETTLED', 'FAILED', 'REVERSED'
+            'PENDING', 'COMPLIANCE_CHECK', 'LEGS_LOCKED', 'ESCROW_FUNDED',
+            'MULTISIG_PENDING', 'APPROVED', 'SIGNED',
+            'BROADCASTED', 'CONFIRMED', 'FAILED', 'REVERSED'
         )
     ),
     CONSTRAINT chk_event_recon CHECK (
@@ -429,7 +450,7 @@ LEFT JOIN LATERAL (
         MAX(e.created_at)                                        AS updated_at,
         (array_agg(e.swap_tx_hash ORDER BY e.created_at DESC)
             FILTER (WHERE e.swap_tx_hash IS NOT NULL))[1]        AS swap_tx_hash,
-        MIN(e.created_at) FILTER (WHERE e.status = 'SETTLED')   AS settled_at,
+        MIN(e.created_at) FILTER (WHERE e.status = 'CONFIRMED')  AS settled_at,
         (array_agg(e.failure_reason ORDER BY e.created_at DESC)
             FILTER (WHERE e.failure_reason IS NOT NULL))[1]      AS failure_reason,
         (array_agg(e.reconciliation_status ORDER BY e.created_at DESC)
@@ -451,6 +472,10 @@ CREATE TABLE compliance_screenings (
     is_cleared           BOOLEAN         NOT NULL,
     reason               TEXT            NOT NULL,
     screening_reference  VARCHAR(256)    NOT NULL,
+    request_id           UUID,
+    trace_id             UUID,
+    actor                VARCHAR(256),
+    actor_role           VARCHAR(50),
     screened_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
@@ -477,6 +502,10 @@ CREATE TABLE settlement_legs (
     beneficiary_entity_id   VARCHAR(100)    NOT NULL,
     amount                  DECIMAL(38,10)  NOT NULL,
     currency                VARCHAR(20)     NOT NULL,
+    request_id              UUID,
+    trace_id                UUID,
+    actor                   VARCHAR(256),
+    actor_role              VARCHAR(50),
     created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_leg_type CHECK (leg_type IN ('SECURITY', 'CASH'))
@@ -504,6 +533,10 @@ CREATE TABLE settlement_leg_events (
     leg_id          UUID            NOT NULL REFERENCES settlement_legs(id),
     status          VARCHAR(20)     NOT NULL,
     failure_reason  TEXT,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_leg_event_status CHECK (
@@ -562,6 +595,10 @@ CREATE TABLE escrow_accounts (
     currency            VARCHAR(20)     NOT NULL,
     escrow_address      VARCHAR(256)    NOT NULL,
     on_chain_tx_hash    VARCHAR(256),
+    request_id          UUID,
+    trace_id            UUID,
+    actor               VARCHAR(256),
+    actor_role          VARCHAR(50),
     created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_escrow_leg_type CHECK (leg_type IN ('SECURITY', 'CASH'))
@@ -588,6 +625,10 @@ CREATE TABLE escrow_account_events (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     escrow_id   UUID            NOT NULL REFERENCES escrow_accounts(id),
     status      VARCHAR(20)     NOT NULL,
+    request_id  UUID,
+    trace_id    UUID,
+    actor       VARCHAR(256),
+    actor_role  VARCHAR(50),
     created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_escrow_event_status CHECK (
@@ -639,6 +680,10 @@ CREATE TABLE multisig_approvals (
     signature       VARCHAR(256)    NOT NULL,
     voted_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     justification   TEXT,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
 
     UNIQUE (instruction_id, custodian_id),
 
@@ -667,6 +712,10 @@ CREATE TABLE hybrid_rail_messages (
     message_type    VARCHAR(30)     NOT NULL,
     payload         JSONB           NOT NULL,
     rail_reference  VARCHAR(256),
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_rail CHECK (rail IN ('SWIFT','FEDWIRE','CLS','ONCHAIN','INTERNAL'))
@@ -694,6 +743,10 @@ CREATE TABLE hybrid_rail_message_events (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     message_id  UUID            NOT NULL REFERENCES hybrid_rail_messages(id),
     status      VARCHAR(20)     NOT NULL,
+    request_id  UUID,
+    trace_id    UUID,
+    actor       VARCHAR(256),
+    actor_role  VARCHAR(50),
     created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_rail_event_status CHECK (
@@ -741,6 +794,10 @@ CREATE TABLE outbox_events (
     aggregate_id    VARCHAR(256)    NOT NULL,
     event_type      VARCHAR(100)    NOT NULL,
     payload         JSONB           NOT NULL,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
@@ -792,7 +849,30 @@ CREATE TRIGGER trg_deny_delete_outbox_delivery_log
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- 10b. outbox_events_current (derived view)
+-- 10c. consumed_events (consumer-side idempotency)
+--      Tracks which events each consumer group has already processed.
+--      Enables exactly-once semantics on top of at-least-once delivery.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE consumed_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id        UUID            NOT NULL,
+    consumer_group  VARCHAR(100)    NOT NULL,
+    processed_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    UNIQUE (event_id, consumer_group)
+);
+
+CREATE INDEX idx_consumed_event_id ON consumed_events (event_id);
+CREATE INDEX idx_consumed_consumer ON consumed_events (consumer_group);
+
+CREATE TRIGGER trg_deny_update_consumed_events
+    BEFORE UPDATE ON consumed_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_consumed_events
+    BEFORE DELETE ON consumed_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 10d. outbox_events_current (derived view)
 -- ─────────────────────────────────────────────────────────────────────────────
 
 CREATE VIEW outbox_events_current AS
@@ -830,6 +910,10 @@ CREATE TABLE reconciliation_reports (
     onchain_supply_matched      BOOLEAN         NOT NULL,
     rail_confirmation_matched   BOOLEAN         NOT NULL,
     mismatches                  JSONB           NOT NULL DEFAULT '[]',
+    request_id                  UUID,
+    trace_id                    UUID,
+    actor                       VARCHAR(256),
+    actor_role                  VARCHAR(50),
     reconciled_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_recon_result CHECK (result IN ('MATCHED','MISMATCH','SUSPENDED'))
@@ -842,6 +926,155 @@ CREATE TRIGGER trg_deny_update_reconciliation_reports
     BEFORE UPDATE ON reconciliation_reports FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 CREATE TRIGGER trg_deny_delete_reconciliation_reports
     BEFORE DELETE ON reconciliation_reports FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 12. audit_log — Append-only audit trail for all operations
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE audit_log (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id  UUID            NOT NULL,
+    trace_id    UUID            NOT NULL,
+    actor       VARCHAR(256)    NOT NULL,
+    actor_role  VARCHAR(50)     NOT NULL,
+    operation   VARCHAR(100)    NOT NULL,
+    resource    VARCHAR(256)    NOT NULL,
+    detail      JSONB,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_log_request ON audit_log (request_id);
+CREATE INDEX idx_audit_log_trace ON audit_log (trace_id);
+CREATE INDEX idx_audit_log_actor ON audit_log (actor);
+
+CREATE TRIGGER trg_deny_update_audit_log
+    BEFORE UPDATE ON audit_log FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_audit_log
+    BEFORE DELETE ON audit_log FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 13. RBAC Tables — Role-Based Access Control
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- 13a. rbac_roles
+CREATE TABLE rbac_roles (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_name   VARCHAR(50)     NOT NULL UNIQUE,
+    description TEXT,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER trg_deny_update_rbac_roles
+    BEFORE UPDATE ON rbac_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_rbac_roles
+    BEFORE DELETE ON rbac_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+-- 13b. rbac_role_permissions
+CREATE TABLE rbac_role_permissions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_id     UUID            NOT NULL REFERENCES rbac_roles(id),
+    permission  VARCHAR(100)    NOT NULL,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    UNIQUE (role_id, permission)
+);
+
+CREATE INDEX idx_rbac_perms_role ON rbac_role_permissions (role_id);
+
+CREATE TRIGGER trg_deny_update_rbac_role_permissions
+    BEFORE UPDATE ON rbac_role_permissions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_rbac_role_permissions
+    BEFORE DELETE ON rbac_role_permissions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+-- 13c. rbac_actor_roles
+CREATE TABLE rbac_actor_roles (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor       VARCHAR(256)    NOT NULL,
+    role_id     UUID            NOT NULL REFERENCES rbac_roles(id),
+    granted_by  VARCHAR(256),
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    UNIQUE (actor, role_id)
+);
+
+CREATE INDEX idx_rbac_actor_roles_actor ON rbac_actor_roles (actor);
+
+CREATE TRIGGER trg_deny_update_rbac_actor_roles
+    BEFORE UPDATE ON rbac_actor_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_rbac_actor_roles
+    BEFORE DELETE ON rbac_actor_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 14. RBAC Seed Data
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- Roles
+INSERT INTO rbac_roles (id, role_name, description) VALUES
+    ('00000000-0000-0000-0000-000000000001', 'ADMIN',
+     'Full system access — all permissions'),
+    ('00000000-0000-0000-0000-000000000002', 'ORIGINATOR',
+     'Can initiate settlement instructions'),
+    ('00000000-0000-0000-0000-000000000003', 'CUSTODIAN',
+     'Can vote on multi-sig, fund/release escrow'),
+    ('00000000-0000-0000-0000-000000000004', 'COMPLIANCE_OFFICER',
+     'Can run compliance screenings'),
+    ('00000000-0000-0000-0000-000000000005', 'SYSTEM',
+     'Internal system operations — seeding, orchestration'),
+    ('00000000-0000-0000-0000-000000000006', 'SIGNER',
+     'Can cast multi-sig votes');
+
+-- Permissions per role
+-- ADMIN: wildcard
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000001', '*');
+
+-- ORIGINATOR
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000002', 'settlement.initiate');
+
+-- CUSTODIAN
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000003', 'multisig.vote'),
+    ('00000000-0000-0000-0000-000000000003', 'escrow.fund'),
+    ('00000000-0000-0000-0000-000000000003', 'escrow.release');
+
+-- COMPLIANCE_OFFICER
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000004', 'compliance.screen');
+
+-- SYSTEM
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000005', 'settlement.initiate'),
+    ('00000000-0000-0000-0000-000000000005', 'settlement.finalize'),
+    ('00000000-0000-0000-0000-000000000005', 'compliance.screen'),
+    ('00000000-0000-0000-0000-000000000005', 'escrow.fund'),
+    ('00000000-0000-0000-0000-000000000005', 'escrow.release'),
+    ('00000000-0000-0000-0000-000000000005', 'multisig.vote'),
+    ('00000000-0000-0000-0000-000000000005', 'swap.execute'),
+    ('00000000-0000-0000-0000-000000000005', 'rail.submit'),
+    ('00000000-0000-0000-0000-000000000005', 'reconciliation.run');
+
+-- SIGNER
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000006', 'multisig.vote');
+
+-- Actor-role assignments for sandbox entities
+INSERT INTO rbac_actor_roles (actor, role_id, granted_by) VALUES
+    ('SYSTEM/seed', '00000000-0000-0000-0000-000000000005', 'BOOTSTRAP'),
+    ('SYSTEM/sandbox', '00000000-0000-0000-0000-000000000005', 'BOOTSTRAP'),
+    ('SYSTEM/orchestrator', '00000000-0000-0000-0000-000000000005', 'BOOTSTRAP'),
+    ('549300BNMGNFKN6LAD61', '00000000-0000-0000-0000-000000000002', 'BOOTSTRAP'),
+    ('571474TGEMMWANRLN572', '00000000-0000-0000-0000-000000000002', 'BOOTSTRAP'),
+    ('IRVTUS3N', '00000000-0000-0000-0000-000000000003', 'BOOTSTRAP'),
+    ('SBOSUS33', '00000000-0000-0000-0000-000000000003', 'BOOTSTRAP'),
+    ('DTCCUS3N', '00000000-0000-0000-0000-000000000003', 'BOOTSTRAP'),
+    ('IRVTUS3N', '00000000-0000-0000-0000-000000000006', 'BOOTSTRAP'),
+    ('SBOSUS33', '00000000-0000-0000-0000-000000000006', 'BOOTSTRAP'),
+    ('DTCCUS3N', '00000000-0000-0000-0000-000000000006', 'BOOTSTRAP'),
+    ('COMPLIANCE/sandbox', '00000000-0000-0000-0000-000000000004', 'BOOTSTRAP');
 
 
 -- ═══════════════════════════════════════════════════════════════════════════
@@ -887,8 +1120,12 @@ VALUES
      '0xSTATESTREET_WALLET_ADDRESS', 'DTC');
 
 -- Initial security balance via ledger entry
-INSERT INTO security_ledger (entity_id, isin, pool, amount, reason)
-VALUES ('549300BNMGNFKN6LAD61', 'US0378331005', 'AVAILABLE', 2000000.0000000000, 'INITIAL_BALANCE');
+INSERT INTO security_ledger
+    (entity_id, isin, pool, amount, reason,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('549300BNMGNFKN6LAD61', 'US0378331005', 'AVAILABLE', 2000000.0000000000, 'INITIAL_BALANCE',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -902,14 +1139,18 @@ VALUES
     (gen_random_uuid(), '549300BNMGNFKN6LAD61', 'USD', 'TOKENIZED_CASH', '021000018', 'BLRKUS33');
 
 -- Initial cash balances via ledger entries
-INSERT INTO cash_ledger (entity_id, currency, pool, amount, reason)
+INSERT INTO cash_ledger
+    (entity_id, currency, pool, amount, reason,
+     request_id, trace_id, actor, actor_role)
 VALUES
-    ('571474TGEMMWANRLN572', 'USD', 'AVAILABLE', 500000000.00, 'INITIAL_BALANCE'),
-    ('549300BNMGNFKN6LAD61', 'USD', 'AVAILABLE', 10000000.00, 'INITIAL_BALANCE');
+    ('571474TGEMMWANRLN572', 'USD', 'AVAILABLE', 500000000.00, 'INITIAL_BALANCE',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
+    ('549300BNMGNFKN6LAD61', 'USD', 'AVAILABLE', 10000000.00, 'INITIAL_BALANCE',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- D. Create DVP Instruction + INITIATED event
+-- D. Create DVP Instruction + PENDING event
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO dvp_instructions (
@@ -919,7 +1160,9 @@ INSERT INTO dvp_instructions (
     seller_wallet, buyer_wallet,
     seller_custodian, buyer_custodian,
     settlement_rail, intended_settlement_date,
-    idempotency_key, created_at
+    idempotency_key,
+    request_id, trace_id, actor, actor_role,
+    created_at
 )
 VALUES (
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -930,12 +1173,18 @@ VALUES (
     '0xBLACKROCK_WALLET_ADDRESS', '0xSTATESTREET_WALLET_ADDRESS',
     'IRVTUS3N', 'SBOSUS33',
     'SWIFT', '2026-03-20',
-    'DVP-BLK-SST-AAPL-20260320-001', NOW()
+    'DVP-BLK-SST-AAPL-20260320-001',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
+    NOW()
 );
 
--- INITIATED event
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'INITIATED');
+-- PENDING event
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'PENDING',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -944,7 +1193,9 @@ VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'INITIATED');
 
 INSERT INTO compliance_screenings
     (id, instruction_id, seller_entity_id, buyer_entity_id,
-     is_cleared, reason, screening_reference, screened_at)
+     is_cleared, reason, screening_reference,
+     request_id, trace_id, actor, actor_role,
+     screened_at)
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -953,12 +1204,17 @@ VALUES (
     'Both counterparties cleared OFAC SDN, EU/UN consolidated, and PEP lists. '
     'No adverse media. LEI verified with GLEIF.',
     'COMPLY-ADV-20260320-BLK-SST-A1B2C3D4|COMPLY-ADV-20260320-SST-BLK-E5F6G7H8',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
     NOW()
 );
 
 -- Advance status: COMPLIANCE_CHECK
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'COMPLIANCE_CHECK');
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'COMPLIANCE_CHECK',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -968,57 +1224,84 @@ VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'COMPLIANCE_CHECK');
 -- ─────────────────────────────────────────────────────────────────────────────
 
 -- Lock security leg: move 500,000 from AVAILABLE to LOCKED for BlackRock
-INSERT INTO security_ledger (entity_id, isin, pool, amount, instruction_id, reason)
+INSERT INTO security_ledger
+    (entity_id, isin, pool, amount, instruction_id, reason,
+     request_id, trace_id, actor, actor_role)
 VALUES
     ('549300BNMGNFKN6LAD61', 'US0378331005', 'AVAILABLE', -500000.0000000000,
-     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK'),
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
     ('549300BNMGNFKN6LAD61', 'US0378331005', 'LOCKED', 500000.0000000000,
-     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK');
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Lock cash leg: move $97,500,000 from AVAILABLE to LOCKED for State Street
-INSERT INTO cash_ledger (entity_id, currency, pool, amount, instruction_id, reason)
+INSERT INTO cash_ledger
+    (entity_id, currency, pool, amount, instruction_id, reason,
+     request_id, trace_id, actor, actor_role)
 VALUES
     ('571474TGEMMWANRLN572', 'USD', 'AVAILABLE', -97500000.00,
-     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK'),
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
     ('571474TGEMMWANRLN572', 'USD', 'LOCKED', 97500000.00,
-     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK');
+     'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LOCK',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Create security leg (immutable record)
 INSERT INTO settlement_legs
     (id, instruction_id, leg_type, originator_entity_id, beneficiary_entity_id,
-     amount, currency)
+     amount, currency,
+     request_id, trace_id, actor, actor_role)
 VALUES (
     'aaaa0001-0000-0000-0000-000000000001',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'SECURITY', '549300BNMGNFKN6LAD61', '571474TGEMMWANRLN572',
-    500000.0000000000, 'US0378331005'
+    500000.0000000000, 'US0378331005',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'
 );
 
 -- Security leg status: LOCKED
-INSERT INTO settlement_leg_events (leg_id, status)
-VALUES ('aaaa0001-0000-0000-0000-000000000001', 'LOCKED');
+INSERT INTO settlement_leg_events
+    (leg_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('aaaa0001-0000-0000-0000-000000000001', 'LOCKED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Create cash leg (immutable record)
 INSERT INTO settlement_legs
     (id, instruction_id, leg_type, originator_entity_id, beneficiary_entity_id,
-     amount, currency)
+     amount, currency,
+     request_id, trace_id, actor, actor_role)
 VALUES (
     'bbbb0002-0000-0000-0000-000000000002',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'CASH', '571474TGEMMWANRLN572', '549300BNMGNFKN6LAD61',
-    97500000.00, 'USD'
+    97500000.00, 'USD',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'
 );
 
 -- Cash leg status: LOCKED
-INSERT INTO settlement_leg_events (leg_id, status)
-VALUES ('bbbb0002-0000-0000-0000-000000000002', 'LOCKED');
+INSERT INTO settlement_leg_events
+    (leg_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('bbbb0002-0000-0000-0000-000000000002', 'LOCKED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Advance instruction status: LEGS_LOCKED
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LEGS_LOCKED');
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'LEGS_LOCKED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Outbox event: legs_locked
-INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
+INSERT INTO outbox_events
+    (id, aggregate_id, event_type, payload,
+     request_id, trace_id, actor, actor_role,
+     created_at)
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -1032,6 +1315,7 @@ VALUES (
         "settlement_amount": "97500000",
         "currency": "USD"
     }'::jsonb,
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
     NOW()
 );
 
@@ -1043,47 +1327,70 @@ VALUES (
 -- Create security escrow (immutable record)
 INSERT INTO escrow_accounts
     (id, instruction_id, leg_type, holder_entity_id, amount, currency,
-     escrow_address, on_chain_tx_hash)
+     escrow_address, on_chain_tx_hash,
+     request_id, trace_id, actor, actor_role)
 VALUES (
     'cccc0003-0000-0000-0000-000000000003',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'SECURITY', '549300BNMGNFKN6LAD61', 500000.0000000000, 'US0378331005',
     '0xSECURITY_ESCROW_CONTRACT_ADDRESS',
-    '0xabc123def456789012345678901234567890123456789012345678901234abcd'
+    '0xabc123def456789012345678901234567890123456789012345678901234abcd',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'
 );
 
 -- Security escrow status: IN_ESCROW
-INSERT INTO escrow_account_events (escrow_id, status)
-VALUES ('cccc0003-0000-0000-0000-000000000003', 'IN_ESCROW');
+INSERT INTO escrow_account_events
+    (escrow_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('cccc0003-0000-0000-0000-000000000003', 'IN_ESCROW',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Create cash escrow (immutable record)
 INSERT INTO escrow_accounts
     (id, instruction_id, leg_type, holder_entity_id, amount, currency,
-     escrow_address, on_chain_tx_hash)
+     escrow_address, on_chain_tx_hash,
+     request_id, trace_id, actor, actor_role)
 VALUES (
     'dddd0004-0000-0000-0000-000000000004',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'CASH', '571474TGEMMWANRLN572', 97500000.00, 'USD',
     '0xCASH_ESCROW_CONTRACT_ADDRESS',
-    '0xdef456abc123012345678901234567890123456789012345678901234567def0'
+    '0xdef456abc123012345678901234567890123456789012345678901234567def0',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'
 );
 
 -- Cash escrow status: IN_ESCROW
-INSERT INTO escrow_account_events (escrow_id, status)
-VALUES ('dddd0004-0000-0000-0000-000000000004', 'IN_ESCROW');
+INSERT INTO escrow_account_events
+    (escrow_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('dddd0004-0000-0000-0000-000000000004', 'IN_ESCROW',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Leg status: IN_ESCROW
-INSERT INTO settlement_leg_events (leg_id, status)
+INSERT INTO settlement_leg_events
+    (leg_id, status,
+     request_id, trace_id, actor, actor_role)
 VALUES
-    ('aaaa0001-0000-0000-0000-000000000001', 'IN_ESCROW'),
-    ('bbbb0002-0000-0000-0000-000000000002', 'IN_ESCROW');
+    ('aaaa0001-0000-0000-0000-000000000001', 'IN_ESCROW',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
+    ('bbbb0002-0000-0000-0000-000000000002', 'IN_ESCROW',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Advance instruction status: ESCROW_FUNDED
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ESCROW_FUNDED');
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ESCROW_FUNDED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Outbox event: escrow_funded
-INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
+INSERT INTO outbox_events
+    (id, aggregate_id, event_type, payload,
+     request_id, trace_id, actor, actor_role,
+     created_at)
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -1095,6 +1402,7 @@ VALUES (
         "security_tx_hash": "0xabc123def456789012345678901234567890123456789012345678901234abcd",
         "cash_tx_hash": "0xdef456abc123012345678901234567890123456789012345678901234567def0"
     }'::jsonb,
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
     NOW()
 );
 
@@ -1105,7 +1413,8 @@ VALUES (
 
 -- Create MT543 message (immutable record)
 INSERT INTO hybrid_rail_messages
-    (id, instruction_id, rail, message_type, payload, rail_reference)
+    (id, instruction_id, rail, message_type, payload, rail_reference,
+     request_id, trace_id, actor, actor_role)
 VALUES (
     'ee110001-0000-0000-0000-000000000005',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -1124,16 +1433,22 @@ VALUES (
         "seller_account": "0xBLACKROCK_WALLET_ADDRESS",
         "buyer_account": "0xSTATESTREET_WALLET_ADDRESS"
     }'::jsonb,
-    'a1b2c3d4-e5f6-7890-abcd-ef0123456789'
+    'a1b2c3d4-e5f6-7890-abcd-ef0123456789',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'
 );
 
 -- MT543 status: SUBMITTED
-INSERT INTO hybrid_rail_message_events (message_id, status)
-VALUES ('ee110001-0000-0000-0000-000000000005', 'SUBMITTED');
+INSERT INTO hybrid_rail_message_events
+    (message_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('ee110001-0000-0000-0000-000000000005', 'SUBMITTED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Create MT103 message (immutable record)
 INSERT INTO hybrid_rail_messages
-    (id, instruction_id, rail, message_type, payload, rail_reference)
+    (id, instruction_id, rail, message_type, payload, rail_reference,
+     request_id, trace_id, actor, actor_role)
 VALUES (
     'ff220002-0000-0000-0000-000000000006',
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -1148,16 +1463,25 @@ VALUES (
         "value_date": "2026-03-20",
         "remittance_info": "DVP/BLK-SST-AAPL-20260320-001/US0378331005"
     }'::jsonb,
-    'b2c3d4e5-f6a1-8901-bcde-f01234567890'
+    'b2c3d4e5-f6a1-8901-bcde-f01234567890',
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'
 );
 
 -- MT103 status: SUBMITTED
-INSERT INTO hybrid_rail_message_events (message_id, status)
-VALUES ('ff220002-0000-0000-0000-000000000006', 'SUBMITTED');
+INSERT INTO hybrid_rail_message_events
+    (message_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('ff220002-0000-0000-0000-000000000006', 'SUBMITTED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Advance to MULTISIG_PENDING
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MULTISIG_PENDING');
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MULTISIG_PENDING',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -1165,26 +1489,40 @@ VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MULTISIG_PENDING');
 -- ─────────────────────────────────────────────────────────────────────────────
 
 INSERT INTO multisig_approvals
-    (id, instruction_id, custodian_id, signer_id, vote, signature, voted_at)
+    (id, instruction_id, custodian_id, signer_id, vote, signature,
+     request_id, trace_id, actor, actor_role,
+     voted_at)
 VALUES
     (gen_random_uuid(), 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
      'IRVTUS3N', 'HSM-BNYM-SIGNER-KEY-001', 'APPROVE',
-     'sha256:bnym_simulated_ecdsa_signature_approval_f47ac10b_20260320', NOW()),
+     'sha256:bnym_simulated_ecdsa_signature_approval_f47ac10b_20260320',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
+     NOW()),
     (gen_random_uuid(), 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
      'SBOSUS33', 'HSM-SST-SIGNER-KEY-007', 'APPROVE',
-     'sha256:sst_simulated_ecdsa_signature_approval_f47ac10b_20260320', NOW());
+     'sha256:sst_simulated_ecdsa_signature_approval_f47ac10b_20260320',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
+     NOW());
 
--- Quorum reached: MULTISIG_APPROVED
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MULTISIG_APPROVED');
+-- Quorum reached: APPROVED
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'APPROVED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Outbox event: multisig_approved
-INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
+INSERT INTO outbox_events
+    (id, aggregate_id, event_type, payload,
+     request_id, trace_id, actor, actor_role,
+     created_at)
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'dvp.multisig_approved',
     '{"instruction_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479", "quorum": 2, "required": 2}'::jsonb,
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
     NOW()
 );
 
@@ -1195,52 +1533,95 @@ VALUES (
 --    State transitions via event INSERTs. Zero UPDATEs.
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- Mark as ATOMIC_SWAP (crash recovery marker)
-INSERT INTO dvp_instruction_events (instruction_id, status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'ATOMIC_SWAP');
+-- Mark as SIGNED (crash recovery marker)
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'SIGNED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
+
+-- Mark as BROADCASTED (tx broadcast to chain)
+INSERT INTO dvp_instruction_events
+    (instruction_id, status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'BROADCASTED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Finalize settlement — atomic ledger update
 BEGIN;
 
-    -- 1. Mark instruction as SETTLED with swap tx hash
-    INSERT INTO dvp_instruction_events (instruction_id, status, swap_tx_hash)
-    VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'SETTLED',
-            '0xATOMIC_SWAP_TX_HASH_f47ac10b_20260320_IRREVOCABLE');
+    -- 1. Mark instruction as CONFIRMED with swap tx hash
+    INSERT INTO dvp_instruction_events
+        (instruction_id, status, swap_tx_hash,
+         request_id, trace_id, actor, actor_role)
+    VALUES
+        ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'CONFIRMED',
+         '0xATOMIC_SWAP_TX_HASH_f47ac10b_20260320_IRREVOCABLE',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 2. Security: debit seller's LOCKED pool
-    INSERT INTO security_ledger (entity_id, isin, pool, amount, instruction_id, reason)
-    VALUES ('549300BNMGNFKN6LAD61', 'US0378331005', 'LOCKED', -500000.0000000000,
-            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_DEBIT');
+    INSERT INTO security_ledger
+        (entity_id, isin, pool, amount, instruction_id, reason,
+         request_id, trace_id, actor, actor_role)
+    VALUES
+        ('549300BNMGNFKN6LAD61', 'US0378331005', 'LOCKED', -500000.0000000000,
+         'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_DEBIT',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 3. Cash: debit buyer's LOCKED pool
-    INSERT INTO cash_ledger (entity_id, currency, pool, amount, instruction_id, reason)
-    VALUES ('571474TGEMMWANRLN572', 'USD', 'LOCKED', -97500000.00,
-            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_DEBIT');
+    INSERT INTO cash_ledger
+        (entity_id, currency, pool, amount, instruction_id, reason,
+         request_id, trace_id, actor, actor_role)
+    VALUES
+        ('571474TGEMMWANRLN572', 'USD', 'LOCKED', -97500000.00,
+         'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_DEBIT',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 4. Security: credit buyer's AVAILABLE pool
-    INSERT INTO security_ledger (entity_id, isin, pool, amount, instruction_id, reason)
-    VALUES ('571474TGEMMWANRLN572', 'US0378331005', 'AVAILABLE', 500000.0000000000,
-            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_CREDIT');
+    INSERT INTO security_ledger
+        (entity_id, isin, pool, amount, instruction_id, reason,
+         request_id, trace_id, actor, actor_role)
+    VALUES
+        ('571474TGEMMWANRLN572', 'US0378331005', 'AVAILABLE', 500000.0000000000,
+         'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_CREDIT',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 5. Cash: credit seller's AVAILABLE pool
-    INSERT INTO cash_ledger (entity_id, currency, pool, amount, instruction_id, reason)
-    VALUES ('549300BNMGNFKN6LAD61', 'USD', 'AVAILABLE', 97500000.00,
-            'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_CREDIT');
+    INSERT INTO cash_ledger
+        (entity_id, currency, pool, amount, instruction_id, reason,
+         request_id, trace_id, actor, actor_role)
+    VALUES
+        ('549300BNMGNFKN6LAD61', 'USD', 'AVAILABLE', 97500000.00,
+         'f47ac10b-58cc-4372-a567-0e02b2c3d479', 'DELIVERY_CREDIT',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 6. Escrow accounts: DELIVERED
-    INSERT INTO escrow_account_events (escrow_id, status)
+    INSERT INTO escrow_account_events
+        (escrow_id, status,
+         request_id, trace_id, actor, actor_role)
     VALUES
-        ('cccc0003-0000-0000-0000-000000000003', 'DELIVERED'),
-        ('dddd0004-0000-0000-0000-000000000004', 'DELIVERED');
+        ('cccc0003-0000-0000-0000-000000000003', 'DELIVERED',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
+        ('dddd0004-0000-0000-0000-000000000004', 'DELIVERED',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 7. Settlement legs: DELIVERED
-    INSERT INTO settlement_leg_events (leg_id, status)
+    INSERT INTO settlement_leg_events
+        (leg_id, status,
+         request_id, trace_id, actor, actor_role)
     VALUES
-        ('aaaa0001-0000-0000-0000-000000000001', 'DELIVERED'),
-        ('bbbb0002-0000-0000-0000-000000000002', 'DELIVERED');
+        ('aaaa0001-0000-0000-0000-000000000001', 'DELIVERED',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
+        ('bbbb0002-0000-0000-0000-000000000002', 'DELIVERED',
+         'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
     -- 8. Outbox event: settled
-    INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
+    INSERT INTO outbox_events
+        (id, aggregate_id, event_type, payload,
+         request_id, trace_id, actor, actor_role,
+         created_at)
     VALUES (
         gen_random_uuid(),
         'f47ac10b-58cc-4372-a567-0e02b2c3d479',
@@ -1257,6 +1638,7 @@ BEGIN;
             "currency": "USD",
             "rail": "SWIFT"
         }'::jsonb,
+        'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
         NOW()
     );
 
@@ -1267,10 +1649,14 @@ COMMIT;
 -- K. Confirm SWIFT Messages
 -- ─────────────────────────────────────────────────────────────────────────────
 
-INSERT INTO hybrid_rail_message_events (message_id, status)
+INSERT INTO hybrid_rail_message_events
+    (message_id, status,
+     request_id, trace_id, actor, actor_role)
 VALUES
-    ('ee110001-0000-0000-0000-000000000005', 'CONFIRMED'),
-    ('ff220002-0000-0000-0000-000000000006', 'CONFIRMED');
+    ('ee110001-0000-0000-0000-000000000005', 'CONFIRMED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM'),
+    ('ff220002-0000-0000-0000-000000000006', 'CONFIRMED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -1281,25 +1667,37 @@ INSERT INTO reconciliation_reports
     (id, instruction_id, result,
      security_leg_verified, cash_leg_verified,
      onchain_supply_matched, rail_confirmation_matched,
-     mismatches, reconciled_at)
+     mismatches,
+     request_id, trace_id, actor, actor_role,
+     reconciled_at)
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'MATCHED', TRUE, TRUE, TRUE, TRUE,
-    '[]'::jsonb, NOW()
+    '[]'::jsonb,
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
+    NOW()
 );
 
 -- Reconciliation status event
-INSERT INTO dvp_instruction_events (instruction_id, reconciliation_status)
-VALUES ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MATCHED');
+INSERT INTO dvp_instruction_events
+    (instruction_id, reconciliation_status,
+     request_id, trace_id, actor, actor_role)
+VALUES
+    ('f47ac10b-58cc-4372-a567-0e02b2c3d479', 'MATCHED',
+     'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM');
 
 -- Outbox event: reconciliation passed
-INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
+INSERT INTO outbox_events
+    (id, aggregate_id, event_type, payload,
+     request_id, trace_id, actor, actor_role,
+     created_at)
 VALUES (
     gen_random_uuid(),
     'f47ac10b-58cc-4372-a567-0e02b2c3d479',
     'dvp.reconciliation_matched',
     '{"instruction_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479", "result": "MATCHED"}'::jsonb,
+    'a0a0a0a0-0000-0000-0000-000000000001', 'b0b0b0b0-0000-0000-0000-000000000001', 'SYSTEM/sandbox', 'SYSTEM',
     NOW()
 );
 
@@ -1533,7 +1931,7 @@ EXPECTED FINAL STATE (V9 Summary Query)
 ══════════════════════════════════════════════════════════════════════════════
 
   trade_reference           = BLK-SST-AAPL-20260320-001
-  settlement_status         = SETTLED
+  settlement_status         = CONFIRMED
   reconciliation_status     = MATCHED
   shares_settled            = 500,000
   notional_settled          = $97,500,000.00
@@ -1569,9 +1967,9 @@ LEDGER AUDIT TRAIL (V11):
   CASH     | BlackRock  | USD  | AVAILABLE |  +97,500,000 | DELIVERY_CREDIT
 
 STATE MACHINE TRACE (from dvp_instruction_events):
-  INITIATED → COMPLIANCE_CHECK → LEGS_LOCKED → ESCROW_FUNDED
-  → MULTISIG_PENDING → MULTISIG_APPROVED → ATOMIC_SWAP
-  → SETTLED (irrevocable) → reconciliation_status = MATCHED
+  PENDING → COMPLIANCE_CHECK → LEGS_LOCKED → ESCROW_FUNDED
+  → MULTISIG_PENDING → APPROVED → SIGNED → BROADCASTED
+  → CONFIRMED (irrevocable) → reconciliation_status = MATCHED
 
 ══════════════════════════════════════════════════════════════════════════════
 */

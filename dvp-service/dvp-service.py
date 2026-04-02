@@ -19,10 +19,22 @@ from enum import Enum
 from typing import Optional
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
+class StructuredFormatter(logging.Formatter):
+    def format(self, record):
+        log_entry = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for attr in ("request_id", "trace_id", "actor"):
+            if hasattr(record, attr):
+                log_entry[attr] = getattr(record, attr)
+        return json.dumps(log_entry)
+
+handler = logging.StreamHandler()
+handler.setFormatter(StructuredFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[handler])
 logger = logging.getLogger("dvp_settlement")
 
 import asyncpg
@@ -56,14 +68,15 @@ def _new_id() -> str:
 # -------------------------------------------------------------------------
 
 class SettlementStatus(str, Enum):
-    INITIATED = "INITIATED"
+    PENDING = "PENDING"
     COMPLIANCE_CHECK = "COMPLIANCE_CHECK"
     LEGS_LOCKED = "LEGS_LOCKED"
     ESCROW_FUNDED = "ESCROW_FUNDED"
     MULTISIG_PENDING = "MULTISIG_PENDING"
-    MULTISIG_APPROVED = "MULTISIG_APPROVED"
-    ATOMIC_SWAP = "ATOMIC_SWAP"
-    SETTLED = "SETTLED"
+    APPROVED = "APPROVED"
+    SIGNED = "SIGNED"
+    BROADCASTED = "BROADCASTED"
+    CONFIRMED = "CONFIRMED"
     FAILED = "FAILED"
     REVERSED = "REVERSED"
 
@@ -114,6 +127,37 @@ class ReconciliationResult(str, Enum):
     SUSPENDED = "SUSPENDED"
 
 
+@dataclass(frozen=True)
+class AuditContext:
+    request_id: str
+    trace_id: str
+    actor: str
+    actor_role: str
+
+    def as_sql_args(self) -> tuple:
+        return (
+            self.request_id, self.trace_id,
+            self.actor, self.actor_role,
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "actor_role": self.actor_role,
+        }
+
+    @staticmethod
+    def system(label: str = "orchestrator") -> "AuditContext":
+        return AuditContext(
+            request_id=str(uuid.uuid4()),
+            trace_id=str(uuid.uuid4()),
+            actor=f"SYSTEM/{label}",
+            actor_role="SYSTEM",
+        )
+
+
 # -------------------------------------------------------------------------
 # Domain Dataclasses
 # -------------------------------------------------------------------------
@@ -136,7 +180,7 @@ class SettlementInstruction:
     buyer_custodian: str
     settlement_rail: SettlementRail
     intended_settlement_date: str
-    status: SettlementStatus = SettlementStatus.INITIATED
+    status: SettlementStatus = SettlementStatus.PENDING
     created_at: str = field(default_factory=_now)
     settled_at: Optional[str] = None
     failure_reason: Optional[str] = None
@@ -377,17 +421,20 @@ class SandboxSigningQueue(AbstractSigningQueue):
 async def _write_outbox(
     db: AbstractDB, instruction_id: str,
     event_type: str, payload: dict,
+    ctx: AuditContext,
 ):
+    payload = {**payload, **ctx.as_dict()}
     await db.execute(
         "INSERT INTO outbox_events "
-        "(id, aggregate_id, event_type, payload, created_at) "
-        "VALUES ($1,$2,$3,$4,$5)",
+        "(id, aggregate_id, event_type, payload, "
+        "request_id, trace_id, actor, actor_role, created_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
         _new_id(), instruction_id, event_type,
-        json.dumps(payload), _now(),
+        json.dumps(payload), *ctx.as_sql_args(), _now(),
     )
 
 
-async def register_entities(db: AbstractDB):
+async def register_entities(db: AbstractDB, ctx: AuditContext):
     """Register demo institutional participants."""
     logger.info("Registering institutional entities...")
     entities = [
@@ -428,7 +475,7 @@ async def register_entities(db: AbstractDB):
     logger.info("Entities registered")
 
 
-async def initialize_positions(db: AbstractDB):
+async def initialize_positions(db: AbstractDB, ctx: AuditContext):
     """Set up custody positions and cash accounts."""
     logger.info("Initializing positions and accounts...")
 
@@ -469,9 +516,12 @@ async def initialize_positions(db: AbstractDB):
     if not bal or Decimal(str(bal["available_quantity"])) == 0:
         await db.execute(
             "INSERT INTO security_ledger "
-            "(entity_id, isin, pool, amount, reason) "
-            "VALUES ($1,$2,'AVAILABLE',$3,'INITIAL_BALANCE')",
+            "(entity_id, isin, pool, amount, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,'AVAILABLE',$3,'INITIAL_BALANCE',"
+            "$4,$5,$6,$7)",
             seller_lei, isin, Decimal("2000000"),
+            *ctx.as_sql_args(),
         )
 
     # Cash accounts (metadata)
@@ -507,15 +557,17 @@ async def initialize_positions(db: AbstractDB):
         if not bal or Decimal(str(bal["balance"])) == 0:
             await db.execute(
                 "INSERT INTO cash_ledger "
-                "(entity_id, currency, pool, amount, reason) "
-                "VALUES ($1,$2,'AVAILABLE',$3,'INITIAL_BALANCE')",
-                lei, "USD", amount,
+                "(entity_id, currency, pool, amount, reason, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,'AVAILABLE',$3,'INITIAL_BALANCE',"
+                "$4,$5,$6,$7)",
+                lei, "USD", amount, *ctx.as_sql_args(),
             )
 
     logger.info("Positions and accounts initialized")
 
 
-async def run_settlement(db: AbstractDB):
+async def run_settlement(db: AbstractDB, ctx: AuditContext):
     """Execute full DVP settlement lifecycle."""
     logger.info("=" * 60)
     logger.info(
@@ -544,10 +596,12 @@ async def run_settlement(db: AbstractDB):
             "seller_wallet, buyer_wallet, "
             "seller_custodian, buyer_custodian, "
             "settlement_rail, intended_settlement_date, "
-            "idempotency_key, created_at) "
+            "idempotency_key, created_at, "
+            "request_id, trace_id, actor, actor_role) "
             "VALUES "
             "($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,"
-            "$11,$12,$13,$14,$15,$16,$17,$18)",
+            "$11,$12,$13,$14,$15,$16,$17,$18,"
+            "$19,$20,$21,$22)",
             instruction_id,
             "BLK-SST-AAPL-DOCKER-001",
             isin, "EQUITY", quantity, price, amount, "USD",
@@ -556,17 +610,20 @@ async def run_settlement(db: AbstractDB):
             "0xSTATESTREET_WALLET_ADDRESS",
             "IRVTUS3N", "SBOSUS33",
             "SWIFT", "2026-03-27",
-            idem_key, _now(),
+            idem_key, _now(), *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO dvp_instruction_events "
-            "(id, instruction_id, status) VALUES ($1,$2,$3)",
+            "(id, instruction_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), instruction_id,
-            SettlementStatus.INITIATED,
+            SettlementStatus.PENDING,
+            *ctx.as_sql_args(),
         )
         await _write_outbox(
             db, instruction_id, "dvp.initiated",
-            {"instruction_id": instruction_id},
+            {"instruction_id": instruction_id}, ctx,
         )
     logger.info("  Instruction %s created", instruction_id)
 
@@ -581,20 +638,24 @@ async def run_settlement(db: AbstractDB):
         "INSERT INTO compliance_screenings "
         "(id, instruction_id, seller_entity_id, "
         "buyer_entity_id, is_cleared, reason, "
-        "screening_reference, screened_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+        "screening_reference, screened_at, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         _new_id(), instruction_id,
         seller_lei, buyer_lei, True,
         "Both counterparties cleared",
         f"{seller_dec.screening_reference}"
         f"|{buyer_dec.screening_reference}",
-        _now(),
+        _now(), *ctx.as_sql_args(),
     )
     await db.execute(
         "INSERT INTO dvp_instruction_events "
-        "(id, instruction_id, status) VALUES ($1,$2,$3)",
+        "(id, instruction_id, status, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
         _new_id(), instruction_id,
         SettlementStatus.COMPLIANCE_CHECK,
+        *ctx.as_sql_args(),
     )
     logger.info("  Both parties cleared")
 
@@ -607,70 +668,91 @@ async def run_settlement(db: AbstractDB):
         await db.execute(
             "INSERT INTO security_ledger "
             "(id, entity_id, isin, pool, amount, "
-            "instruction_id, reason) "
-            "VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'LOCK')",
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'LOCK',"
+            "$6,$7,$8,$9)",
             _new_id(), seller_lei, isin, -quantity,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO security_ledger "
             "(id, entity_id, isin, pool, amount, "
-            "instruction_id, reason) "
-            "VALUES ($1,$2,$3,'LOCKED',$4,$5,'LOCK')",
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,'LOCKED',$4,$5,'LOCK',"
+            "$6,$7,$8,$9)",
             _new_id(), seller_lei, isin, quantity,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         # Lock cash
         await db.execute(
             "INSERT INTO cash_ledger "
             "(id, entity_id, currency, pool, amount, "
-            "instruction_id, reason) "
-            "VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'LOCK')",
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'LOCK',"
+            "$6,$7,$8,$9)",
             _new_id(), buyer_lei, "USD", -amount,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO cash_ledger "
             "(id, entity_id, currency, pool, amount, "
-            "instruction_id, reason) "
-            "VALUES ($1,$2,$3,'LOCKED',$4,$5,'LOCK')",
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,'LOCKED',$4,$5,'LOCK',"
+            "$6,$7,$8,$9)",
             _new_id(), buyer_lei, "USD", amount,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         # Create legs
         await db.execute(
             "INSERT INTO settlement_legs "
             "(id, instruction_id, leg_type, "
             "originator_entity_id, beneficiary_entity_id, "
-            "amount, currency) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "amount, currency, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             sec_leg_id, instruction_id, "SECURITY",
             seller_lei, buyer_lei, quantity, isin,
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO settlement_leg_events "
-            "(id, leg_id, status) VALUES ($1,$2,$3)",
+            "(id, leg_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), sec_leg_id, "LOCKED",
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO settlement_legs "
             "(id, instruction_id, leg_type, "
             "originator_entity_id, beneficiary_entity_id, "
-            "amount, currency) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "amount, currency, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             cash_leg_id, instruction_id, "CASH",
             buyer_lei, seller_lei, amount, "USD",
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO settlement_leg_events "
-            "(id, leg_id, status) VALUES ($1,$2,$3)",
+            "(id, leg_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), cash_leg_id, "LOCKED",
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO dvp_instruction_events "
-            "(id, instruction_id, status) VALUES ($1,$2,$3)",
+            "(id, instruction_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), instruction_id,
             SettlementStatus.LEGS_LOCKED,
+            *ctx.as_sql_args(),
         )
         await _write_outbox(
             db, instruction_id, "dvp.legs_locked",
@@ -678,7 +760,7 @@ async def run_settlement(db: AbstractDB):
                 "instruction_id": instruction_id,
                 "security_leg_id": sec_leg_id,
                 "cash_leg_id": cash_leg_id,
-            },
+            }, ctx,
         )
     logger.info("  Both legs locked")
 
@@ -702,44 +784,62 @@ async def run_settlement(db: AbstractDB):
             "INSERT INTO escrow_accounts "
             "(id, instruction_id, leg_type, "
             "holder_entity_id, amount, currency, "
-            "escrow_address, on_chain_tx_hash) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "escrow_address, on_chain_tx_hash, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,"
+            "$9,$10,$11,$12)",
             sec_escrow_id, instruction_id, "SECURITY",
             seller_lei, quantity, isin,
             "0xSECURITY_ESCROW_CONTRACT", sec_tx,
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO escrow_account_events "
-            "(id, escrow_id, status) VALUES ($1,$2,$3)",
+            "(id, escrow_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), sec_escrow_id, "IN_ESCROW",
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO escrow_accounts "
             "(id, instruction_id, leg_type, "
             "holder_entity_id, amount, currency, "
-            "escrow_address, on_chain_tx_hash) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            "escrow_address, on_chain_tx_hash, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,"
+            "$9,$10,$11,$12)",
             cash_escrow_id, instruction_id, "CASH",
             buyer_lei, amount, "USD",
             "0xCASH_ESCROW_CONTRACT", cash_tx,
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO escrow_account_events "
-            "(id, escrow_id, status) VALUES ($1,$2,$3)",
+            "(id, escrow_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), cash_escrow_id, "IN_ESCROW",
+            *ctx.as_sql_args(),
         )
         # Leg events
         for leg_id in [sec_leg_id, cash_leg_id]:
             await db.execute(
                 "INSERT INTO settlement_leg_events "
-                "(id, leg_id, status) VALUES ($1,$2,$3)",
+                "(id, leg_id, status, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), leg_id, "IN_ESCROW",
+                *ctx.as_sql_args(),
             )
         await db.execute(
             "INSERT INTO dvp_instruction_events "
-            "(id, instruction_id, status) VALUES ($1,$2,$3)",
+            "(id, instruction_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), instruction_id,
             SettlementStatus.ESCROW_FUNDED,
+            *ctx.as_sql_args(),
         )
         await _write_outbox(
             db, instruction_id, "dvp.escrow_funded",
@@ -747,7 +847,7 @@ async def run_settlement(db: AbstractDB):
                 "instruction_id": instruction_id,
                 "security_tx_hash": sec_tx,
                 "cash_tx_hash": cash_tx,
-            },
+            }, ctx,
         )
     logger.info("  Escrow funded — sec_tx=%s cash_tx=%s", sec_tx, cash_tx)
 
@@ -764,21 +864,29 @@ async def run_settlement(db: AbstractDB):
         await db.execute(
             "INSERT INTO hybrid_rail_messages "
             "(id, instruction_id, rail, message_type, "
-            "payload, rail_reference) "
-            "VALUES ($1,$2,$3,$4,$5,$6)",
+            "payload, rail_reference, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             msg_id, instruction_id, "SWIFT", msg_type,
             json.dumps({"uetr": uetr}), uetr,
+            *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO hybrid_rail_message_events "
-            "(id, message_id, status) VALUES ($1,$2,$3)",
+            "(id, message_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), msg_id, "SUBMITTED",
+            *ctx.as_sql_args(),
         )
     await db.execute(
         "INSERT INTO dvp_instruction_events "
-        "(id, instruction_id, status) VALUES ($1,$2,$3)",
+        "(id, instruction_id, status, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
         _new_id(), instruction_id,
         SettlementStatus.MULTISIG_PENDING,
+        *ctx.as_sql_args(),
     )
     logger.info("  SWIFT MT543 + MT103 submitted")
 
@@ -795,20 +903,25 @@ async def run_settlement(db: AbstractDB):
         await db.execute(
             "INSERT INTO multisig_approvals "
             "(id, instruction_id, custodian_id, signer_id, "
-            "vote, signature, voted_at) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            "vote, signature, voted_at, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             _new_id(), instruction_id, cust_id, signer,
-            "APPROVE", sig, _now(),
+            "APPROVE", sig, _now(), *ctx.as_sql_args(),
         )
     await db.execute(
         "INSERT INTO dvp_instruction_events "
-        "(id, instruction_id, status) VALUES ($1,$2,$3)",
+        "(id, instruction_id, status, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
         _new_id(), instruction_id,
-        SettlementStatus.MULTISIG_APPROVED,
+        SettlementStatus.APPROVED,
+        *ctx.as_sql_args(),
     )
     await _write_outbox(
         db, instruction_id, "dvp.multisig_approved",
         {"instruction_id": instruction_id, "quorum": 2},
+        ctx,
     )
     logger.info("  Multi-sig quorum reached (2-of-3)")
 
@@ -816,9 +929,12 @@ async def run_settlement(db: AbstractDB):
     logger.info("[7/9] Executing atomic swap (IRREVOCABLE)...")
     await db.execute(
         "INSERT INTO dvp_instruction_events "
-        "(id, instruction_id, status) VALUES ($1,$2,$3)",
+        "(id, instruction_id, status, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
         _new_id(), instruction_id,
-        SettlementStatus.ATOMIC_SWAP,
+        SettlementStatus.SIGNED,
+        *ctx.as_sql_args(),
     )
     swap_tx = await chain.atomic_swap(
         "0xSECURITY_ESCROW_CONTRACT",
@@ -827,61 +943,85 @@ async def run_settlement(db: AbstractDB):
         "0xBLACKROCK_WALLET_ADDRESS",
         instruction_id,
     )
+    # Mark transaction as broadcast to chain
+    await db.execute(
+        "INSERT INTO dvp_instruction_events "
+        "(id, instruction_id, status, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        _new_id(), instruction_id,
+        SettlementStatus.BROADCASTED,
+        *ctx.as_sql_args(),
+    )
     async with db.transaction():
         await db.execute(
             "INSERT INTO dvp_instruction_events "
-            "(id, instruction_id, status, swap_tx_hash) "
-            "VALUES ($1,$2,$3,$4)",
+            "(id, instruction_id, status, swap_tx_hash, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             _new_id(), instruction_id,
-            SettlementStatus.SETTLED, swap_tx,
+            SettlementStatus.CONFIRMED, swap_tx,
+            *ctx.as_sql_args(),
         )
         # Debit/credit ledger entries
         await db.execute(
             "INSERT INTO security_ledger "
             "(id, entity_id, isin, pool, amount, "
-            "instruction_id, reason) "
-            "VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT')",
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,'LOCKED',$4,$5,"
+            "'DELIVERY_DEBIT',$6,$7,$8,$9)",
             _new_id(), seller_lei, isin, -quantity,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO cash_ledger "
             "(id, entity_id, currency, pool, amount, "
-            "instruction_id, reason) "
-            "VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT')",
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,'LOCKED',$4,$5,"
+            "'DELIVERY_DEBIT',$6,$7,$8,$9)",
             _new_id(), buyer_lei, "USD", -amount,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO security_ledger "
             "(id, entity_id, isin, pool, amount, "
-            "instruction_id, reason) "
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
             "VALUES ($1,$2,$3,'AVAILABLE',$4,$5,"
-            "'DELIVERY_CREDIT')",
+            "'DELIVERY_CREDIT',$6,$7,$8,$9)",
             _new_id(), buyer_lei, isin, quantity,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         await db.execute(
             "INSERT INTO cash_ledger "
             "(id, entity_id, currency, pool, amount, "
-            "instruction_id, reason) "
+            "instruction_id, reason, "
+            "request_id, trace_id, actor, actor_role) "
             "VALUES ($1,$2,$3,'AVAILABLE',$4,$5,"
-            "'DELIVERY_CREDIT')",
+            "'DELIVERY_CREDIT',$6,$7,$8,$9)",
             _new_id(), seller_lei, "USD", amount,
-            instruction_id,
+            instruction_id, *ctx.as_sql_args(),
         )
         # Mark escrows and legs as delivered
         for esc_id in [sec_escrow_id, cash_escrow_id]:
             await db.execute(
                 "INSERT INTO escrow_account_events "
-                "(id, escrow_id, status) VALUES ($1,$2,$3)",
+                "(id, escrow_id, status, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), esc_id, "DELIVERED",
+                *ctx.as_sql_args(),
             )
         for leg_id in [sec_leg_id, cash_leg_id]:
             await db.execute(
                 "INSERT INTO settlement_leg_events "
-                "(id, leg_id, status) VALUES ($1,$2,$3)",
+                "(id, leg_id, status, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), leg_id, "DELIVERED",
+                *ctx.as_sql_args(),
             )
         await _write_outbox(
             db, instruction_id, "dvp.settled",
@@ -891,7 +1031,7 @@ async def run_settlement(db: AbstractDB):
                 "isin": isin,
                 "quantity": str(quantity),
                 "settlement_amount": str(amount),
-            },
+            }, ctx,
         )
     logger.info("  Atomic swap executed — tx=%s", swap_tx)
 
@@ -905,8 +1045,11 @@ async def run_settlement(db: AbstractDB):
     for msg in msgs:
         await db.execute(
             "INSERT INTO hybrid_rail_message_events "
-            "(id, message_id, status) VALUES ($1,$2,$3)",
+            "(id, message_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), msg["id"], "CONFIRMED",
+            *ctx.as_sql_args(),
         )
     logger.info("  SWIFT messages confirmed")
 
@@ -918,17 +1061,21 @@ async def run_settlement(db: AbstractDB):
         "security_leg_verified, cash_leg_verified, "
         "onchain_supply_matched, "
         "rail_confirmation_matched, "
-        "mismatches, reconciled_at) "
-        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        "mismatches, reconciled_at, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,"
+        "$10,$11,$12,$13)",
         _new_id(), instruction_id, "MATCHED",
         True, True, True, True,
-        json.dumps([]), _now(),
+        json.dumps([]), _now(), *ctx.as_sql_args(),
     )
     await db.execute(
         "INSERT INTO dvp_instruction_events "
-        "(id, instruction_id, reconciliation_status) "
-        "VALUES ($1,$2,$3)",
+        "(id, instruction_id, reconciliation_status, "
+        "request_id, trace_id, actor, actor_role) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7)",
         _new_id(), instruction_id, "MATCHED",
+        *ctx.as_sql_args(),
     )
     await _write_outbox(
         db, instruction_id,
@@ -936,7 +1083,7 @@ async def run_settlement(db: AbstractDB):
         {
             "instruction_id": instruction_id,
             "result": "MATCHED",
-        },
+        }, ctx,
     )
     logger.info("  Reconciliation: MATCHED")
 
@@ -980,9 +1127,10 @@ async def main():
     db = AsyncpgDB(pool)
     logger.info("Connected to PostgreSQL")
 
-    await register_entities(db)
-    await initialize_positions(db)
-    await run_settlement(db)
+    ctx = AuditContext.system("docker-demo")
+    await register_entities(db, ctx)
+    await initialize_positions(db, ctx)
+    await run_settlement(db, ctx)
 
     await pool.close()
     logger.info("DVP service completed. Pool closed.")

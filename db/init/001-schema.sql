@@ -120,6 +120,10 @@ CREATE TABLE security_ledger (
     amount          DECIMAL(38,10)  NOT NULL,
     instruction_id  UUID,
     reason          VARCHAR(50)     NOT NULL,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_sec_pool CHECK (pool IN ('AVAILABLE','LOCKED'))
 );
@@ -150,6 +154,10 @@ CREATE TABLE cash_ledger (
     amount          DECIMAL(38,2)   NOT NULL,
     instruction_id  UUID,
     reason          VARCHAR(50)     NOT NULL,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     CONSTRAINT chk_cash_pool CHECK (pool IN ('AVAILABLE','LOCKED'))
 );
@@ -267,6 +275,10 @@ CREATE TABLE dvp_instructions (
     settlement_rail          VARCHAR(20)     NOT NULL,
     intended_settlement_date DATE            NOT NULL,
     idempotency_key          VARCHAR(256)    NOT NULL UNIQUE,
+    request_id               UUID,
+    trace_id                 UUID,
+    actor                    VARCHAR(256),
+    actor_role               VARCHAR(50),
     created_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_quantity          CHECK (quantity          > 0),
@@ -302,13 +314,17 @@ CREATE TABLE dvp_instruction_events (
     swap_tx_hash          VARCHAR(256),
     failure_reason        TEXT,
     reconciliation_status VARCHAR(20),
+    request_id            UUID,
+    trace_id              UUID,
+    actor                 VARCHAR(256),
+    actor_role            VARCHAR(50),
     created_at            TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_event_status CHECK (
         status IS NULL OR status IN (
-            'INITIATED', 'COMPLIANCE_CHECK', 'LEGS_LOCKED', 'ESCROW_FUNDED',
-            'MULTISIG_PENDING', 'MULTISIG_APPROVED', 'ATOMIC_SWAP',
-            'SETTLED', 'FAILED', 'REVERSED'
+            'PENDING', 'COMPLIANCE_CHECK', 'LEGS_LOCKED', 'ESCROW_FUNDED',
+            'MULTISIG_PENDING', 'APPROVED', 'SIGNED',
+            'BROADCASTED', 'CONFIRMED', 'FAILED', 'REVERSED'
         )
     ),
     CONSTRAINT chk_event_recon CHECK (
@@ -361,7 +377,7 @@ LEFT JOIN LATERAL (
         MAX(e.created_at)                                        AS updated_at,
         (array_agg(e.swap_tx_hash ORDER BY e.created_at DESC)
             FILTER (WHERE e.swap_tx_hash IS NOT NULL))[1]        AS swap_tx_hash,
-        MIN(e.created_at) FILTER (WHERE e.status = 'SETTLED')   AS settled_at,
+        MIN(e.created_at) FILTER (WHERE e.status = 'CONFIRMED')  AS settled_at,
         (array_agg(e.failure_reason ORDER BY e.created_at DESC)
             FILTER (WHERE e.failure_reason IS NOT NULL))[1]      AS failure_reason,
         (array_agg(e.reconciliation_status ORDER BY e.created_at DESC)
@@ -383,6 +399,10 @@ CREATE TABLE compliance_screenings (
     is_cleared           BOOLEAN         NOT NULL,
     reason               TEXT            NOT NULL,
     screening_reference  VARCHAR(256)    NOT NULL,
+    request_id           UUID,
+    trace_id             UUID,
+    actor                VARCHAR(256),
+    actor_role           VARCHAR(50),
     screened_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
@@ -407,6 +427,10 @@ CREATE TABLE settlement_legs (
     beneficiary_entity_id   VARCHAR(100)    NOT NULL,
     amount                  DECIMAL(38,10)  NOT NULL,
     currency                VARCHAR(20)     NOT NULL,
+    request_id              UUID,
+    trace_id                UUID,
+    actor                   VARCHAR(256),
+    actor_role              VARCHAR(50),
     created_at              TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_leg_type CHECK (leg_type IN ('SECURITY', 'CASH'))
@@ -434,6 +458,10 @@ CREATE TABLE settlement_leg_events (
     leg_id          UUID            NOT NULL REFERENCES settlement_legs(id),
     status          VARCHAR(20)     NOT NULL,
     failure_reason  TEXT,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_leg_event_status CHECK (
@@ -490,6 +518,10 @@ CREATE TABLE escrow_accounts (
     currency            VARCHAR(20)     NOT NULL,
     escrow_address      VARCHAR(256)    NOT NULL,
     on_chain_tx_hash    VARCHAR(256),
+    request_id          UUID,
+    trace_id            UUID,
+    actor               VARCHAR(256),
+    actor_role          VARCHAR(50),
     created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_escrow_leg_type CHECK (leg_type IN ('SECURITY', 'CASH'))
@@ -516,6 +548,10 @@ CREATE TABLE escrow_account_events (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     escrow_id   UUID            NOT NULL REFERENCES escrow_accounts(id),
     status      VARCHAR(20)     NOT NULL,
+    request_id  UUID,
+    trace_id    UUID,
+    actor       VARCHAR(256),
+    actor_role  VARCHAR(50),
     created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_escrow_event_status CHECK (
@@ -567,6 +603,10 @@ CREATE TABLE multisig_approvals (
     signature       VARCHAR(256)    NOT NULL,
     voted_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
     justification   TEXT,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
 
     UNIQUE (instruction_id, custodian_id),
 
@@ -593,6 +633,10 @@ CREATE TABLE hybrid_rail_messages (
     message_type    VARCHAR(30)     NOT NULL,
     payload         JSONB           NOT NULL,
     rail_reference  VARCHAR(256),
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_rail CHECK (rail IN ('SWIFT','FEDWIRE','CLS','ONCHAIN','INTERNAL'))
@@ -620,6 +664,10 @@ CREATE TABLE hybrid_rail_message_events (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     message_id  UUID            NOT NULL REFERENCES hybrid_rail_messages(id),
     status      VARCHAR(20)     NOT NULL,
+    request_id  UUID,
+    trace_id    UUID,
+    actor       VARCHAR(256),
+    actor_role  VARCHAR(50),
     created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_rail_event_status CHECK (
@@ -666,6 +714,10 @@ CREATE TABLE outbox_events (
     aggregate_id    VARCHAR(256)    NOT NULL,
     event_type      VARCHAR(100)    NOT NULL,
     payload         JSONB           NOT NULL,
+    request_id      UUID,
+    trace_id        UUID,
+    actor           VARCHAR(256),
+    actor_role      VARCHAR(50),
     created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
 );
 
@@ -713,7 +765,30 @@ CREATE TRIGGER trg_deny_delete_outbox_delivery_log
 
 
 -- -------------------------------------------------------------------------
--- 10b. outbox_events_current (derived view)
+-- 10c. consumed_events (consumer-side idempotency)
+--      Tracks which events each consumer group has already processed.
+--      Enables exactly-once semantics on top of at-least-once delivery.
+-- -------------------------------------------------------------------------
+
+CREATE TABLE consumed_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id        UUID            NOT NULL,
+    consumer_group  VARCHAR(100)    NOT NULL,
+    processed_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    UNIQUE (event_id, consumer_group)
+);
+
+CREATE INDEX idx_consumed_event_id ON consumed_events (event_id);
+CREATE INDEX idx_consumed_consumer ON consumed_events (consumer_group);
+
+CREATE TRIGGER trg_deny_update_consumed_events
+    BEFORE UPDATE ON consumed_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_consumed_events
+    BEFORE DELETE ON consumed_events FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- -------------------------------------------------------------------------
+-- 10d. outbox_events_current (derived view)
 -- -------------------------------------------------------------------------
 
 CREATE VIEW outbox_events_current AS
@@ -751,6 +826,10 @@ CREATE TABLE reconciliation_reports (
     onchain_supply_matched      BOOLEAN         NOT NULL,
     rail_confirmation_matched   BOOLEAN         NOT NULL,
     mismatches                  JSONB           NOT NULL DEFAULT '[]',
+    request_id                  UUID,
+    trace_id                    UUID,
+    actor                       VARCHAR(256),
+    actor_role                  VARCHAR(50),
     reconciled_at               TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_recon_result CHECK (result IN ('MATCHED','MISMATCH','SUSPENDED'))
@@ -763,3 +842,158 @@ CREATE TRIGGER trg_deny_update_reconciliation_reports
     BEFORE UPDATE ON reconciliation_reports FOR EACH ROW EXECUTE FUNCTION deny_mutation();
 CREATE TRIGGER trg_deny_delete_reconciliation_reports
     BEFORE DELETE ON reconciliation_reports FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- -------------------------------------------------------------------------
+-- 12. audit_log — Append-only audit trail for all operations
+-- -------------------------------------------------------------------------
+
+CREATE TABLE audit_log (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id  UUID            NOT NULL,
+    trace_id    UUID            NOT NULL,
+    actor       VARCHAR(256)    NOT NULL,
+    actor_role  VARCHAR(50)     NOT NULL,
+    operation   VARCHAR(100)    NOT NULL,
+    resource    VARCHAR(256)    NOT NULL,
+    detail      JSONB,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE audit_log IS
+  'Append-only audit trail. Every service operation writes an entry '
+  'with actor identity, operation type, and resource affected.';
+
+CREATE INDEX idx_audit_log_request   ON audit_log (request_id);
+CREATE INDEX idx_audit_log_trace     ON audit_log (trace_id);
+CREATE INDEX idx_audit_log_actor     ON audit_log (actor);
+CREATE INDEX idx_audit_log_operation ON audit_log (operation);
+CREATE INDEX idx_audit_log_created   ON audit_log (created_at);
+
+CREATE TRIGGER trg_deny_update_audit_log
+    BEFORE UPDATE ON audit_log FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_audit_log
+    BEFORE DELETE ON audit_log FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- -------------------------------------------------------------------------
+-- 13. RBAC Tables — Role-Based Access Control
+-- -------------------------------------------------------------------------
+
+-- 13a. rbac_roles
+CREATE TABLE rbac_roles (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_name   VARCHAR(50)     NOT NULL UNIQUE,
+    description TEXT,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER trg_deny_update_rbac_roles
+    BEFORE UPDATE ON rbac_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_rbac_roles
+    BEFORE DELETE ON rbac_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+-- 13b. rbac_role_permissions
+CREATE TABLE rbac_role_permissions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    role_id     UUID            NOT NULL REFERENCES rbac_roles(id),
+    permission  VARCHAR(100)    NOT NULL,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    UNIQUE (role_id, permission)
+);
+
+CREATE INDEX idx_rbac_perms_role ON rbac_role_permissions (role_id);
+
+CREATE TRIGGER trg_deny_update_rbac_role_permissions
+    BEFORE UPDATE ON rbac_role_permissions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_rbac_role_permissions
+    BEFORE DELETE ON rbac_role_permissions FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+-- 13c. rbac_actor_roles
+CREATE TABLE rbac_actor_roles (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor       VARCHAR(256)    NOT NULL,
+    role_id     UUID            NOT NULL REFERENCES rbac_roles(id),
+    granted_by  VARCHAR(256),
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    UNIQUE (actor, role_id)
+);
+
+CREATE INDEX idx_rbac_actor_roles_actor ON rbac_actor_roles (actor);
+
+CREATE TRIGGER trg_deny_update_rbac_actor_roles
+    BEFORE UPDATE ON rbac_actor_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+CREATE TRIGGER trg_deny_delete_rbac_actor_roles
+    BEFORE DELETE ON rbac_actor_roles FOR EACH ROW EXECUTE FUNCTION deny_mutation();
+
+
+-- -------------------------------------------------------------------------
+-- 14. RBAC Seed Data
+-- -------------------------------------------------------------------------
+
+-- Roles
+INSERT INTO rbac_roles (id, role_name, description) VALUES
+    ('00000000-0000-0000-0000-000000000001', 'ADMIN',
+     'Full system access — all permissions'),
+    ('00000000-0000-0000-0000-000000000002', 'ORIGINATOR',
+     'Can initiate settlement instructions'),
+    ('00000000-0000-0000-0000-000000000003', 'CUSTODIAN',
+     'Can vote on multi-sig, fund/release escrow'),
+    ('00000000-0000-0000-0000-000000000004', 'COMPLIANCE_OFFICER',
+     'Can run compliance screenings'),
+    ('00000000-0000-0000-0000-000000000005', 'SYSTEM',
+     'Internal system operations — seeding, orchestration'),
+    ('00000000-0000-0000-0000-000000000006', 'SIGNER',
+     'Can cast multi-sig votes');
+
+-- Permissions per role
+-- ADMIN: wildcard
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000001', '*');
+
+-- ORIGINATOR
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000002', 'settlement.initiate');
+
+-- CUSTODIAN
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000003', 'multisig.vote'),
+    ('00000000-0000-0000-0000-000000000003', 'escrow.fund'),
+    ('00000000-0000-0000-0000-000000000003', 'escrow.release');
+
+-- COMPLIANCE_OFFICER
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000004', 'compliance.screen');
+
+-- SYSTEM
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000005', 'settlement.initiate'),
+    ('00000000-0000-0000-0000-000000000005', 'settlement.finalize'),
+    ('00000000-0000-0000-0000-000000000005', 'compliance.screen'),
+    ('00000000-0000-0000-0000-000000000005', 'escrow.fund'),
+    ('00000000-0000-0000-0000-000000000005', 'escrow.release'),
+    ('00000000-0000-0000-0000-000000000005', 'multisig.vote'),
+    ('00000000-0000-0000-0000-000000000005', 'swap.execute'),
+    ('00000000-0000-0000-0000-000000000005', 'rail.submit'),
+    ('00000000-0000-0000-0000-000000000005', 'reconciliation.run');
+
+-- SIGNER
+INSERT INTO rbac_role_permissions (role_id, permission) VALUES
+    ('00000000-0000-0000-0000-000000000006', 'multisig.vote');
+
+-- Actor-role assignments for sandbox entities
+INSERT INTO rbac_actor_roles (actor, role_id, granted_by) VALUES
+    ('SYSTEM/seed', '00000000-0000-0000-0000-000000000005', 'BOOTSTRAP'),
+    ('SYSTEM/sandbox', '00000000-0000-0000-0000-000000000005', 'BOOTSTRAP'),
+    ('SYSTEM/orchestrator', '00000000-0000-0000-0000-000000000005', 'BOOTSTRAP'),
+    ('549300BNMGNFKN6LAD61', '00000000-0000-0000-0000-000000000002', 'BOOTSTRAP'),
+    ('571474TGEMMWANRLN572', '00000000-0000-0000-0000-000000000002', 'BOOTSTRAP'),
+    ('IRVTUS3N', '00000000-0000-0000-0000-000000000003', 'BOOTSTRAP'),
+    ('SBOSUS33', '00000000-0000-0000-0000-000000000003', 'BOOTSTRAP'),
+    ('DTCCUS3N', '00000000-0000-0000-0000-000000000003', 'BOOTSTRAP'),
+    ('IRVTUS3N', '00000000-0000-0000-0000-000000000006', 'BOOTSTRAP'),
+    ('SBOSUS33', '00000000-0000-0000-0000-000000000006', 'BOOTSTRAP'),
+    ('DTCCUS3N', '00000000-0000-0000-0000-000000000006', 'BOOTSTRAP'),
+    ('COMPLIANCE/sandbox', '00000000-0000-0000-0000-000000000004', 'BOOTSTRAP');

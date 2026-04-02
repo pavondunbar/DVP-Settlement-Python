@@ -23,3 +23,15 @@ GRANT INSERT ON outbox_delivery_log TO readonly_user;
 
 -- Outbox publisher reads the derived view for health checks
 GRANT SELECT ON outbox_events_current TO readonly_user;
+
+-- RBAC tables (read-only access for permission checking)
+GRANT SELECT ON rbac_roles TO readonly_user;
+GRANT SELECT ON rbac_role_permissions TO readonly_user;
+GRANT SELECT ON rbac_actor_roles TO readonly_user;
+
+-- Consumer-side idempotency tracking
+GRANT SELECT ON consumed_events TO readonly_user;
+GRANT INSERT ON consumed_events TO readonly_user;
+
+-- Audit log (read-only access for monitoring)
+GRANT SELECT ON audit_log TO readonly_user;

@@ -41,6 +41,7 @@ Architecture Overview
 import asyncio
 import asyncpg
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -58,10 +59,26 @@ from typing import Optional
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
  
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
+class StructuredFormatter(logging.Formatter):
+    """Emits each log record as a single JSON line with audit fields."""
+
+    def format(self, record):
+        log_entry = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for attr in ("request_id", "trace_id", "actor"):
+            val = getattr(record, attr, None)
+            if val is not None:
+                log_entry[attr] = val
+        return json.dumps(log_entry)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(StructuredFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
 logger = logging.getLogger("dvp_settlement")
  
  
@@ -71,14 +88,15 @@ logger = logging.getLogger("dvp_settlement")
  
 class SettlementStatus(str, Enum):
     """Top-level DVP instruction lifecycle."""
-    INITIATED        = "INITIATED"          # Instruction received
+    PENDING          = "PENDING"            # Instruction received
     COMPLIANCE_CHECK = "COMPLIANCE_CHECK"   # Screening in progress
     LEGS_LOCKED      = "LEGS_LOCKED"        # Both legs reserved
     ESCROW_FUNDED    = "ESCROW_FUNDED"      # Escrow accounts credited
     MULTISIG_PENDING = "MULTISIG_PENDING"   # Awaiting multi-sig threshold
-    MULTISIG_APPROVED= "MULTISIG_APPROVED"  # Quorum reached
-    ATOMIC_SWAP      = "ATOMIC_SWAP"        # Swap in flight (irrevocable)
-    SETTLED          = "SETTLED"            # T+0 final settlement
+    APPROVED         = "APPROVED"           # Quorum reached
+    SIGNED           = "SIGNED"             # Swap in flight (irrevocable)
+    BROADCASTED      = "BROADCASTED"        # Tx broadcast to chain
+    CONFIRMED        = "CONFIRMED"          # T+0 final settlement
     FAILED           = "FAILED"             # Non-recoverable failure
     REVERSED         = "REVERSED"           # Reversed / unwound
  
@@ -163,7 +181,7 @@ class SettlementInstruction:
     buyer_custodian: str                # Custodian / CSD for buyer
     settlement_rail: SettlementRail
     intended_settlement_date: str       # ISO date YYYY-MM-DD (T+0 or T+1)
-    status: SettlementStatus = SettlementStatus.INITIATED
+    status: SettlementStatus = SettlementStatus.PENDING
     created_at: str = field(default_factory=lambda: _now())
     settled_at: Optional[str] = None
     failure_reason: Optional[str] = None
@@ -275,6 +293,7 @@ class AtomicSwapError(DVPSettlementError):   pass
 class SettlementRailError(DVPSettlementError): pass
 class ReconciliationHalt(DVPSettlementError): pass
 class DuplicateInstructionError(DVPSettlementError): pass
+class AuthorizationError(DVPSettlementError): pass
  
  
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,6 +307,177 @@ def _new_id() -> str:
     return str(uuid.uuid4())
  
  
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit Context + RBAC
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class AuditContext:
+    """Immutable audit metadata threaded through every service call."""
+    request_id: str
+    trace_id: str
+    actor: str
+    actor_role: str
+
+    def as_sql_args(self) -> tuple:
+        return (self.request_id, self.trace_id,
+                self.actor, self.actor_role)
+
+    def as_dict(self) -> dict:
+        return {
+            "request_id": self.request_id,
+            "trace_id": self.trace_id,
+            "actor": self.actor,
+            "actor_role": self.actor_role,
+        }
+
+    @staticmethod
+    def system(label: str = "orchestrator") -> "AuditContext":
+        return AuditContext(
+            request_id=str(uuid.uuid4()),
+            trace_id=str(uuid.uuid4()),
+            actor=f"SYSTEM/{label}",
+            actor_role="SYSTEM",
+        )
+
+    @staticmethod
+    def for_actor(
+        actor: str, actor_role: str, trace_id: str,
+    ) -> "AuditContext":
+        return AuditContext(
+            request_id=str(uuid.uuid4()),
+            trace_id=trace_id,
+            actor=actor,
+            actor_role=actor_role,
+        )
+
+
+class RBACChecker:
+    """Loads and caches per-actor permissions from the RBAC tables."""
+
+    def __init__(self, db):
+        self._db = db
+        self._cache: dict[str, set[str]] = {}
+
+    async def _load_permissions(self, actor: str) -> set[str]:
+        if actor in self._cache:
+            return self._cache[actor]
+        rows = await self._db.fetch(
+            """
+            SELECT rp.permission
+            FROM rbac_actor_roles ar
+            JOIN rbac_role_permissions rp ON rp.role_id = ar.role_id
+            WHERE ar.actor = $1
+            """,
+            actor,
+        )
+        perms = {r["permission"] for r in rows}
+        self._cache[actor] = perms
+        return perms
+
+    async def check_permission(
+        self, ctx: AuditContext, permission: str,
+    ) -> None:
+        perms = await self._load_permissions(ctx.actor)
+        if "*" in perms or permission in perms:
+            return
+        raise AuthorizationError(
+            f"Actor {ctx.actor!r} (role={ctx.actor_role}) "
+            f"lacks permission {permission!r}"
+        )
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+
+def require_permission(permission: str):
+    """Async decorator that enforces RBAC before method execution."""
+    def decorator(fn):
+        @functools.wraps(fn)
+        async def wrapper(self, *args, **kwargs):
+            ctx = kwargs.get("ctx") or next(
+                (a for a in args
+                 if isinstance(a, AuditContext)),
+                None,
+            )
+            if ctx is None:
+                raise AuthorizationError(
+                    "AuditContext required but not provided"
+                )
+            await self._rbac.check_permission(ctx, permission)
+            return await fn(self, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+async def write_audit_log(
+    db, ctx: AuditContext,
+    operation: str, resource: str,
+    detail: Optional[dict] = None,
+) -> None:
+    await db.execute(
+        """
+        INSERT INTO audit_log
+            (id, request_id, trace_id, actor, actor_role,
+             operation, resource, detail)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        """,
+        _new_id(), ctx.request_id, ctx.trace_id,
+        ctx.actor, ctx.actor_role,
+        operation, resource,
+        json.dumps(detail) if detail else None,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Consumer-Side Idempotency
+# ─────────────────────────────────────────────────────────────────────────────
+
+class IdempotentConsumer(ABC):
+    """
+    Abstract base for Kafka consumers with exactly-once processing.
+    Checks consumed_events table before processing; inserts after.
+    """
+
+    def __init__(self, db, consumer_group: str):
+        self._db = db
+        self._consumer_group = consumer_group
+        self._log = logging.getLogger(
+            f"dvp.consumer.{consumer_group}"
+        )
+
+    async def _already_processed(self, event_id: str) -> bool:
+        row = await self._db.fetchrow(
+            "SELECT 1 FROM consumed_events "
+            "WHERE event_id = $1 AND consumer_group = $2",
+            event_id, self._consumer_group,
+        )
+        return row is not None
+
+    async def _mark_processed(self, event_id: str) -> None:
+        await self._db.execute(
+            "INSERT INTO consumed_events "
+            "(event_id, consumer_group) "
+            "VALUES ($1, $2) "
+            "ON CONFLICT (event_id, consumer_group) DO NOTHING",
+            event_id, self._consumer_group,
+        )
+
+    async def handle(self, event_id: str, payload: dict):
+        if await self._already_processed(event_id):
+            self._log.debug(
+                "Skipping duplicate event_id=%s", event_id
+            )
+            return
+        await self.process(payload)
+        await self._mark_processed(event_id)
+
+    @abstractmethod
+    async def process(self, payload: dict) -> None:
+        ...
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Abstract Infrastructure Interfaces
 # ─────────────────────────────────────────────────────────────────────────────
@@ -401,16 +591,20 @@ class ComplianceScreeningService:
     LexisNexis Bridger, or direct OFAC API.
     """
  
-    def __init__(self, db: AbstractDB, provider: AbstractComplianceProvider):
+    def __init__(self, db: AbstractDB, provider: AbstractComplianceProvider,
+                 rbac: RBACChecker):
         self._db = db
         self._provider = provider
+        self._rbac = rbac
         self._log = logging.getLogger("dvp.compliance")
  
+    @require_permission("compliance.screen")
     async def screen_instruction(
         self,
         instruction: SettlementInstruction,
         seller_jurisdiction: str,
         buyer_jurisdiction: str,
+        ctx: AuditContext = None,
     ) -> ComplianceDecision:
         """
         Screens both counterparties concurrently.  Fails fast if either
@@ -455,13 +649,22 @@ class ComplianceScreeningService:
             """
             INSERT INTO compliance_screenings
               (id, instruction_id, seller_entity_id, buyer_entity_id,
-               is_cleared, reason, screening_reference, screened_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+               is_cleared, reason, screening_reference,
+               request_id, trace_id, actor, actor_role,
+               screened_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
             """,
             _new_id(), instruction.id,
             instruction.seller_entity_id, instruction.buyer_entity_id,
             decision.is_cleared, decision.reason,
-            decision.screening_reference, decision.screened_at,
+            decision.screening_reference,
+            *ctx.as_sql_args(),
+            decision.screened_at,
+        )
+        await write_audit_log(
+            self._db, ctx, "compliance.screen",
+            f"instruction/{instruction.id}",
+            {"is_cleared": decision.is_cleared},
         )
  
         self._log.info(
@@ -488,13 +691,17 @@ class SettlementLegService:
     Mirrors DTCC Project Ion leg-matching and DTC position locking.
     """
  
-    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter):
+    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter,
+                 rbac: RBACChecker):
         self._db = db
         self._chain = chain
+        self._rbac = rbac
         self._log = logging.getLogger("dvp.legs")
  
+    @require_permission("settlement.initiate")
     async def create_and_lock_legs(
-        self, instruction: SettlementInstruction
+        self, instruction: SettlementInstruction,
+        ctx: AuditContext = None,
     ) -> tuple[SettlementLeg, SettlementLeg]:
         """
         Atomically creates both legs and locks the underlying positions.
@@ -586,23 +793,27 @@ class SettlementLegService:
                 """
                 INSERT INTO security_ledger
                     (id, entity_id, isin, pool, amount,
-                     instruction_id, reason)
-                VALUES ($1, $2, $3, 'AVAILABLE', $4, $5, 'LOCK')
+                     instruction_id, reason,
+                     request_id, trace_id, actor, actor_role)
+                VALUES ($1, $2, $3, 'AVAILABLE', $4, $5, 'LOCK',
+                        $6, $7, $8, $9)
                 """,
                 _new_id(), instruction.seller_entity_id,
                 instruction.isin, -instruction.quantity,
-                instruction.id,
+                instruction.id, *ctx.as_sql_args(),
             )
             await self._db.execute(
                 """
                 INSERT INTO security_ledger
                     (id, entity_id, isin, pool, amount,
-                     instruction_id, reason)
-                VALUES ($1, $2, $3, 'LOCKED', $4, $5, 'LOCK')
+                     instruction_id, reason,
+                     request_id, trace_id, actor, actor_role)
+                VALUES ($1, $2, $3, 'LOCKED', $4, $5, 'LOCK',
+                        $6, $7, $8, $9)
                 """,
                 _new_id(), instruction.seller_entity_id,
                 instruction.isin, instruction.quantity,
-                instruction.id,
+                instruction.id, *ctx.as_sql_args(),
             )
 
             # ── Append cash ledger entries (debit AVAILABLE, credit LOCKED) ──
@@ -610,23 +821,29 @@ class SettlementLegService:
                 """
                 INSERT INTO cash_ledger
                     (id, entity_id, currency, pool, amount,
-                     instruction_id, reason)
-                VALUES ($1, $2, $3, 'AVAILABLE', $4, $5, 'LOCK')
+                     instruction_id, reason,
+                     request_id, trace_id, actor, actor_role)
+                VALUES ($1, $2, $3, 'AVAILABLE', $4, $5, 'LOCK',
+                        $6, $7, $8, $9)
                 """,
                 _new_id(), instruction.buyer_entity_id,
                 instruction.currency,
                 -instruction.settlement_amount, instruction.id,
+                *ctx.as_sql_args(),
             )
             await self._db.execute(
                 """
                 INSERT INTO cash_ledger
                     (id, entity_id, currency, pool, amount,
-                     instruction_id, reason)
-                VALUES ($1, $2, $3, 'LOCKED', $4, $5, 'LOCK')
+                     instruction_id, reason,
+                     request_id, trace_id, actor, actor_role)
+                VALUES ($1, $2, $3, 'LOCKED', $4, $5, 'LOCK',
+                        $6, $7, $8, $9)
                 """,
                 _new_id(), instruction.buyer_entity_id,
                 instruction.currency,
                 instruction.settlement_amount, instruction.id,
+                *ctx.as_sql_args(),
             )
  
             # ── Insert security leg ──
@@ -634,16 +851,21 @@ class SettlementLegService:
                 """
                 INSERT INTO settlement_legs
                   (id, instruction_id, leg_type, originator_entity_id,
-                   beneficiary_entity_id, amount, currency)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                   beneficiary_entity_id, amount, currency,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 """,
                 security_leg_id, instruction.id, LegType.SECURITY,
                 instruction.seller_entity_id, instruction.buyer_entity_id,
                 instruction.quantity, instruction.isin,
+                *ctx.as_sql_args(),
             )
             await self._db.execute(
-                "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO settlement_leg_events "
+                "(id, leg_id, status, request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), security_leg_id, LegStatus.LOCKED,
+                *ctx.as_sql_args(),
             )
  
             # ── Insert cash leg ──
@@ -651,22 +873,30 @@ class SettlementLegService:
                 """
                 INSERT INTO settlement_legs
                   (id, instruction_id, leg_type, originator_entity_id,
-                   beneficiary_entity_id, amount, currency)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                   beneficiary_entity_id, amount, currency,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                 """,
                 cash_leg_id, instruction.id, LegType.CASH,
                 instruction.buyer_entity_id, instruction.seller_entity_id,
                 instruction.settlement_amount, instruction.currency,
+                *ctx.as_sql_args(),
             )
             await self._db.execute(
-                "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO settlement_leg_events "
+                "(id, leg_id, status, request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), cash_leg_id, LegStatus.LOCKED,
+                *ctx.as_sql_args(),
             )
  
             # ── Update instruction status ──
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), instruction.id, SettlementStatus.LEGS_LOCKED,
+                *ctx.as_sql_args(),
             )
  
             # ── Outbox event (same transaction) ──
@@ -680,8 +910,13 @@ class SettlementLegService:
                     "quantity": str(instruction.quantity),
                     "settlement_amount": str(instruction.settlement_amount),
                     "currency": instruction.currency,
-                }
+                },
+                ctx,
             )
+        await write_audit_log(
+            self._db, ctx, "settlement.lock_legs",
+            f"instruction/{instruction.id}",
+        )
  
         security_leg = SettlementLeg(
             id=security_leg_id,
@@ -744,11 +979,14 @@ class EscrowService:
     DTCC Project Ion's DLT-based escrow mechanism.
     """
  
-    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter):
+    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter,
+                 rbac: RBACChecker):
         self._db    = db
         self._chain = chain
+        self._rbac  = rbac
         self._log   = logging.getLogger("dvp.escrow")
  
+    @require_permission("escrow.fund")
     async def fund_escrow_accounts(
         self,
         instruction: SettlementInstruction,
@@ -756,6 +994,7 @@ class EscrowService:
         cash_escrow_address: str,
         security_token_address: str,
         cash_token_address: str,
+        ctx: AuditContext = None,
     ) -> tuple[EscrowAccount, EscrowAccount]:
         """
         Initiates on-chain transfers into escrow smart contracts.
@@ -793,39 +1032,52 @@ class EscrowService:
                 """
                 INSERT INTO escrow_accounts
                   (id, instruction_id, leg_type, holder_entity_id, amount,
-                   currency, escrow_address, on_chain_tx_hash)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                   currency, escrow_address, on_chain_tx_hash,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                 """,
                 sec_escrow_id, instruction.id, LegType.SECURITY,
                 instruction.seller_entity_id, instruction.quantity,
                 instruction.isin,
                 security_escrow_address, sec_tx_hash,
+                *ctx.as_sql_args(),
             )
             await self._db.execute(
-                "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO escrow_account_events "
+                "(id, escrow_id, status, request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), sec_escrow_id, LegStatus.IN_ESCROW,
+                *ctx.as_sql_args(),
             )
  
             await self._db.execute(
                 """
                 INSERT INTO escrow_accounts
                   (id, instruction_id, leg_type, holder_entity_id, amount,
-                   currency, escrow_address, on_chain_tx_hash)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                   currency, escrow_address, on_chain_tx_hash,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                 """,
                 cash_escrow_id, instruction.id, LegType.CASH,
                 instruction.buyer_entity_id, instruction.settlement_amount,
                 instruction.currency,
                 cash_escrow_address, cash_tx_hash,
+                *ctx.as_sql_args(),
             )
             await self._db.execute(
-                "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO escrow_account_events "
+                "(id, escrow_id, status, request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), cash_escrow_id, LegStatus.IN_ESCROW,
+                *ctx.as_sql_args(),
             )
  
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                 _new_id(), instruction.id, SettlementStatus.ESCROW_FUNDED,
+                *ctx.as_sql_args(),
             )
  
             legs = await self._db.fetch(
@@ -834,8 +1086,11 @@ class EscrowService:
             )
             for leg in legs:
                 await self._db.execute(
-                    "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                    "INSERT INTO settlement_leg_events "
+                    "(id, leg_id, status, request_id, trace_id, actor, actor_role) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     _new_id(), leg["id"], LegStatus.IN_ESCROW,
+                    *ctx.as_sql_args(),
                 )
  
             await self._write_outbox_event(
@@ -847,8 +1102,13 @@ class EscrowService:
                     "security_tx_hash": sec_tx_hash,
                     "cash_tx_hash": cash_tx_hash,
                     "funded_at": funded_at,
-                }
+                },
+                ctx,
             )
+        await write_audit_log(
+            self._db, ctx, "escrow.fund",
+            f"instruction/{instruction.id}",
+        )
  
         sec_escrow = EscrowAccount(
             id=sec_escrow_id, instruction_id=instruction.id,
@@ -867,7 +1127,11 @@ class EscrowService:
                        instruction.id, sec_tx_hash, cash_tx_hash)
         return sec_escrow, cash_escrow
  
-    async def release_to_originator(self, instruction_id: str, reason: str):
+    @require_permission("escrow.release")
+    async def release_to_originator(
+        self, instruction_id: str, reason: str,
+        ctx: AuditContext = None,
+    ):
         """
         Unwind path: Release both escrow accounts back to originators.
         Called on failure or expiry.  Requires multi-sig approval
@@ -881,16 +1145,26 @@ class EscrowService:
             )
             for esc in escrows:
                 await self._db.execute(
-                    "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                    "INSERT INTO escrow_account_events "
+                    "(id, escrow_id, status, request_id, trace_id, actor, actor_role) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     _new_id(), esc["id"], LegStatus.RELEASED,
+                    *ctx.as_sql_args(),
                 )
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status, failure_reason) VALUES ($1,$2,$3,$4)",
-                _new_id(), instruction_id, SettlementStatus.REVERSED, reason,
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, failure_reason, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                _new_id(), instruction_id,
+                SettlementStatus.REVERSED, reason,
+                *ctx.as_sql_args(),
             )
             await self._write_outbox_event(
                 instruction_id, "dvp.escrow_released",
-                {"instruction_id": instruction_id, "reason": reason, "released_at": now}
+                {"instruction_id": instruction_id,
+                 "reason": reason, "released_at": now},
+                ctx,
             )
         self._log.warning("Escrow released for %s — reason: %s", instruction_id, reason)
  
@@ -933,12 +1207,15 @@ class MultiSigApprovalService:
         db: AbstractDB,
         hsm: AbstractHSMSigningService,
         required_custodians: list[str],
+        rbac: RBACChecker = None,
     ):
         self._db = db
         self._hsm = hsm
         self._required_custodians = required_custodians
+        self._rbac = rbac
         self._log = logging.getLogger("dvp.multisig")
  
+    @require_permission("multisig.vote")
     async def cast_vote(
         self,
         instruction_id: str,
@@ -946,6 +1223,7 @@ class MultiSigApprovalService:
         signer_id: str,
         vote: MultiSigVote,
         justification: Optional[str] = None,
+        ctx: AuditContext = None,
     ) -> MultiSigApproval:
         """
         Records an approval/rejection vote from a custodian signer.
@@ -956,6 +1234,17 @@ class MultiSigApprovalService:
                 f"Custodian {custodian_id} is not a required signer for this instruction."
             )
  
+        # Separation of duties: voter cannot be the initiator
+        initiator_row = await self._db.fetchrow(
+            "SELECT actor FROM dvp_instructions WHERE id = $1",
+            instruction_id,
+        )
+        if initiator_row and initiator_row["actor"] == ctx.actor:
+            raise AuthorizationError(
+                f"Actor {ctx.actor!r} initiated this instruction "
+                "and cannot also vote on it (separation of duties)"
+            )
+
         # ── Generate HSM signature OUTSIDE DB transaction ──
         sig_payload = {
             "instruction_id": instruction_id,
@@ -984,11 +1273,13 @@ class MultiSigApprovalService:
                 """
                 INSERT INTO multisig_approvals
                   (id, instruction_id, custodian_id, signer_id, vote,
-                   signature, voted_at, justification)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                   signature, voted_at, justification,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                 """,
                 approval_id, instruction_id, custodian_id, signer_id,
                 vote, signature, now, justification,
+                *ctx.as_sql_args(),
             )
  
             await self._write_outbox_event(
@@ -999,8 +1290,14 @@ class MultiSigApprovalService:
                     "custodian_id": custodian_id,
                     "vote": vote,
                     "voted_at": now,
-                }
+                },
+                ctx,
             )
+        await write_audit_log(
+            self._db, ctx, "multisig.vote",
+            f"instruction/{instruction_id}",
+            {"custodian_id": custodian_id, "vote": vote},
+        )
  
         approval = MultiSigApproval(
             id=approval_id, instruction_id=instruction_id,
@@ -1029,20 +1326,30 @@ class MultiSigApprovalService:
             return False
         return approve_count >= self.REQUIRED_QUORUM
  
-    async def finalize_quorum(self, instruction_id: str):
+    async def finalize_quorum(
+        self, instruction_id: str,
+        ctx: AuditContext = None,
+    ):
         """
-        Marks the instruction as MULTISIG_APPROVED in a single atomic write.
+        Marks the instruction as APPROVED in a single atomic write.
         Called by DVPSettlementService once check_quorum() returns True.
         """
         now = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
-                _new_id(), instruction_id, SettlementStatus.MULTISIG_APPROVED,
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                _new_id(), instruction_id,
+                SettlementStatus.APPROVED,
+                *ctx.as_sql_args(),
             )
             await self._write_outbox_event(
                 instruction_id, "dvp.multisig_approved",
-                {"instruction_id": instruction_id, "approved_at": now}
+                {"instruction_id": instruction_id,
+                 "approved_at": now},
+                ctx,
             )
         self._log.info("Multi-sig quorum reached for instruction %s", instruction_id)
  
@@ -1076,17 +1383,22 @@ class AtomicSwapExecutor:
     JPMorgan Onyx's intraday repo atomic swap architecture.
     """
  
-    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter, signing_queue: AbstractSigningQueue):
+    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter,
+                 signing_queue: AbstractSigningQueue,
+                 rbac: RBACChecker = None):
         self._db    = db
         self._chain = chain
         self._queue = signing_queue
+        self._rbac  = rbac
         self._log   = logging.getLogger("dvp.atomic_swap")
  
+    @require_permission("swap.execute")
     async def execute(
         self,
         instruction: SettlementInstruction,
         security_escrow_address: str,
         cash_escrow_address: str,
+        ctx: AuditContext = None,
     ) -> str:
         """
         Returns the atomic swap transaction hash on success.
@@ -1101,8 +1413,13 @@ class AtomicSwapExecutor:
         # ── Mark as in-flight BEFORE chain call (enables crash recovery) ──
         async with self._db.transaction():
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
-                _new_id(), instruction.id, SettlementStatus.ATOMIC_SWAP,
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                _new_id(), instruction.id,
+                SettlementStatus.SIGNED,
+                *ctx.as_sql_args(),
             )
             await self._write_outbox_event(
                 instruction.id, "dvp.atomic_swap_initiated",
@@ -1111,7 +1428,8 @@ class AtomicSwapExecutor:
                     "security_escrow": security_escrow_address,
                     "cash_escrow": cash_escrow_address,
                     "initiated_at": now,
-                }
+                },
+                ctx,
             )
  
         # ── Execute on-chain atomic swap (outside DB transaction) ──
@@ -1124,61 +1442,99 @@ class AtomicSwapExecutor:
                 instruction_id=instruction.id,
             )
         except Exception as exc:
-            await self._handle_swap_failure(instruction.id, str(exc))
+            await self._handle_swap_failure(
+                instruction.id, str(exc), ctx
+            )
             raise AtomicSwapError(
                 f"Atomic swap failed for instruction {instruction.id}: {exc}"
             ) from exc
  
+        # ── Mark transaction as broadcast to chain ──
+        await self._db.execute(
+            "INSERT INTO dvp_instruction_events "
+            "(id, instruction_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            _new_id(), instruction.id,
+            SettlementStatus.BROADCASTED,
+            *ctx.as_sql_args(),
+        )
+
         # ── Settlement finality — update all records atomically ──
         settled_at = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status, swap_tx_hash) VALUES ($1,$2,$3,$4)",
-                _new_id(), instruction.id, SettlementStatus.SETTLED, swap_tx_hash,
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, swap_tx_hash, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                _new_id(), instruction.id,
+                SettlementStatus.CONFIRMED, swap_tx_hash,
+                *ctx.as_sql_args(),
             )
  
             # Debit seller's locked securities
             await self._db.execute(
                 """
                 INSERT INTO security_ledger
-                  (id, entity_id, isin, pool, amount, instruction_id, reason)
-                VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT')
+                  (id, entity_id, isin, pool, amount,
+                   instruction_id, reason,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT',
+                        $6,$7,$8,$9)
                 """,
-                _new_id(), instruction.seller_entity_id, instruction.isin,
+                _new_id(), instruction.seller_entity_id,
+                instruction.isin,
                 -instruction.quantity, instruction.id,
+                *ctx.as_sql_args(),
             )
 
             # Debit buyer's locked cash
             await self._db.execute(
                 """
                 INSERT INTO cash_ledger
-                  (id, entity_id, currency, pool, amount, instruction_id, reason)
-                VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT')
+                  (id, entity_id, currency, pool, amount,
+                   instruction_id, reason,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,'LOCKED',$4,$5,'DELIVERY_DEBIT',
+                        $6,$7,$8,$9)
                 """,
-                _new_id(), instruction.buyer_entity_id, instruction.currency,
+                _new_id(), instruction.buyer_entity_id,
+                instruction.currency,
                 -instruction.settlement_amount, instruction.id,
+                *ctx.as_sql_args(),
             )
 
             # Credit buyer's available securities
             await self._db.execute(
                 """
                 INSERT INTO security_ledger
-                  (id, entity_id, isin, pool, amount, instruction_id, reason)
-                VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'DELIVERY_CREDIT')
+                  (id, entity_id, isin, pool, amount,
+                   instruction_id, reason,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'DELIVERY_CREDIT',
+                        $6,$7,$8,$9)
                 """,
-                _new_id(), instruction.buyer_entity_id, instruction.isin,
+                _new_id(), instruction.buyer_entity_id,
+                instruction.isin,
                 instruction.quantity, instruction.id,
+                *ctx.as_sql_args(),
             )
 
             # Credit seller's available cash
             await self._db.execute(
                 """
                 INSERT INTO cash_ledger
-                  (id, entity_id, currency, pool, amount, instruction_id, reason)
-                VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'DELIVERY_CREDIT')
+                  (id, entity_id, currency, pool, amount,
+                   instruction_id, reason,
+                   request_id, trace_id, actor, actor_role)
+                VALUES ($1,$2,$3,'AVAILABLE',$4,$5,'DELIVERY_CREDIT',
+                        $6,$7,$8,$9)
                 """,
-                _new_id(), instruction.seller_entity_id, instruction.currency,
+                _new_id(), instruction.seller_entity_id,
+                instruction.currency,
                 instruction.settlement_amount, instruction.id,
+                *ctx.as_sql_args(),
             )
  
             # Mark escrow accounts as delivered
@@ -1188,8 +1544,12 @@ class AtomicSwapExecutor:
             )
             for esc in escrows:
                 await self._db.execute(
-                    "INSERT INTO escrow_account_events (id, escrow_id, status) VALUES ($1,$2,$3)",
+                    "INSERT INTO escrow_account_events "
+                    "(id, escrow_id, status, "
+                    "request_id, trace_id, actor, actor_role) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     _new_id(), esc["id"], LegStatus.DELIVERED,
+                    *ctx.as_sql_args(),
                 )
  
             # Mark settlement legs as delivered
@@ -1199,8 +1559,12 @@ class AtomicSwapExecutor:
             )
             for leg in legs:
                 await self._db.execute(
-                    "INSERT INTO settlement_leg_events (id, leg_id, status) VALUES ($1,$2,$3)",
+                    "INSERT INTO settlement_leg_events "
+                    "(id, leg_id, status, "
+                    "request_id, trace_id, actor, actor_role) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     _new_id(), leg["id"], LegStatus.DELIVERED,
+                    *ctx.as_sql_args(),
                 )
  
             await self._write_outbox_event(
@@ -1215,8 +1579,14 @@ class AtomicSwapExecutor:
                     "settlement_amount": str(instruction.settlement_amount),
                     "currency": instruction.currency,
                     "settled_at": settled_at,
-                }
+                },
+                ctx,
             )
+        await write_audit_log(
+            self._db, ctx, "swap.execute",
+            f"instruction/{instruction.id}",
+            {"swap_tx_hash": swap_tx_hash},
+        )
  
         self._log.info(
             "DVP SETTLED — instruction=%s tx=%s at=%s",
@@ -1224,16 +1594,26 @@ class AtomicSwapExecutor:
         )
         return swap_tx_hash
  
-    async def _handle_swap_failure(self, instruction_id: str, reason: str):
+    async def _handle_swap_failure(
+        self, instruction_id: str, reason: str,
+        ctx: AuditContext = None,
+    ):
         now = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status, failure_reason) VALUES ($1,$2,$3,$4)",
-                _new_id(), instruction_id, SettlementStatus.FAILED, reason,
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, failure_reason, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                _new_id(), instruction_id,
+                SettlementStatus.FAILED, reason,
+                *(ctx.as_sql_args() if ctx else (None,None,None,None)),
             )
             await self._write_outbox_event(
                 instruction_id, "dvp.swap_failed",
-                {"instruction_id": instruction_id, "reason": reason, "failed_at": now}
+                {"instruction_id": instruction_id,
+                 "reason": reason, "failed_at": now},
+                ctx,
             )
         self._log.error("Atomic swap FAILED for instruction %s: %s", instruction_id, reason)
  
@@ -1282,15 +1662,19 @@ class HybridSettlementGateway:
         swift: AbstractSWIFTGateway,
         fedwire: AbstractFedWireGateway,
         cls: AbstractCLSGateway,
+        rbac: RBACChecker = None,
     ):
         self._db      = db
         self._swift   = swift
         self._fedwire = fedwire
         self._cls     = cls
+        self._rbac    = rbac
         self._log     = logging.getLogger("dvp.hybrid_rail")
  
+    @require_permission("rail.submit")
     async def submit_settlement_messages(
-        self, instruction: SettlementInstruction
+        self, instruction: SettlementInstruction,
+        ctx: AuditContext = None,
     ) -> list[HybridRailMessage]:
         """
         Submits the appropriate payment messages based on the instruction's
@@ -1299,11 +1683,11 @@ class HybridSettlementGateway:
         messages = []
  
         if instruction.settlement_rail == SettlementRail.SWIFT:
-            messages += await self._submit_swift(instruction)
+            messages += await self._submit_swift(instruction, ctx)
         elif instruction.settlement_rail == SettlementRail.FEDWIRE:
-            messages += await self._submit_fedwire(instruction)
+            messages += await self._submit_fedwire(instruction, ctx)
         elif instruction.settlement_rail == SettlementRail.CLS:
-            messages += await self._submit_cls(instruction)
+            messages += await self._submit_cls(instruction, ctx)
         elif instruction.settlement_rail == SettlementRail.ONCHAIN:
             self._log.info("Instruction %s is fully on-chain — no hybrid rail needed", instruction.id)
         elif instruction.settlement_rail == SettlementRail.INTERNAL:
@@ -1313,7 +1697,10 @@ class HybridSettlementGateway:
  
     # ── SWIFT ────────────────────────────────────────────────────────────────
  
-    async def _submit_swift(self, instruction: SettlementInstruction) -> list[HybridRailMessage]:
+    async def _submit_swift(
+        self, instruction: SettlementInstruction,
+        ctx: AuditContext = None,
+    ) -> list[HybridRailMessage]:
         messages = []
  
         # MT543: Deliver Against Payment — seller side
@@ -1333,7 +1720,8 @@ class HybridSettlementGateway:
         }
         uetr = await self._swift.send_mt("MT543", mt543_payload)
         msg = await self._persist_rail_message(
-            instruction.id, SettlementRail.SWIFT, "MT543", mt543_payload, uetr
+            instruction.id, SettlementRail.SWIFT, "MT543",
+            mt543_payload, uetr, ctx,
         )
         messages.append(msg)
  
@@ -1350,7 +1738,8 @@ class HybridSettlementGateway:
         }
         uetr_cash = await self._swift.send_mt("MT103", mt103_payload)
         msg_cash = await self._persist_rail_message(
-            instruction.id, SettlementRail.SWIFT, "MT103", mt103_payload, uetr_cash
+            instruction.id, SettlementRail.SWIFT, "MT103",
+            mt103_payload, uetr_cash, ctx,
         )
         messages.append(msg_cash)
  
@@ -1362,7 +1751,10 @@ class HybridSettlementGateway:
  
     # ── FedWire ──────────────────────────────────────────────────────────────
  
-    async def _submit_fedwire(self, instruction: SettlementInstruction) -> list[HybridRailMessage]:
+    async def _submit_fedwire(
+        self, instruction: SettlementInstruction,
+        ctx: AuditContext = None,
+    ) -> list[HybridRailMessage]:
         fedwire_payload = {
             "business_function_code": "CTR",
             "amount": str(instruction.settlement_amount),
@@ -1374,14 +1766,18 @@ class HybridSettlementGateway:
         }
         imad = await self._fedwire.submit_fedwire(fedwire_payload)
         msg = await self._persist_rail_message(
-            instruction.id, SettlementRail.FEDWIRE, "FEDWIRE_CTR", fedwire_payload, imad
+            instruction.id, SettlementRail.FEDWIRE,
+            "FEDWIRE_CTR", fedwire_payload, imad, ctx,
         )
         self._log.info("FedWire submitted for %s — IMAD=%s", instruction.id, imad)
         return [msg]
  
     # ── CLS ──────────────────────────────────────────────────────────────────
  
-    async def _submit_cls(self, instruction: SettlementInstruction) -> list[HybridRailMessage]:
+    async def _submit_cls(
+        self, instruction: SettlementInstruction,
+        ctx: AuditContext = None,
+    ) -> list[HybridRailMessage]:
         """
         CLS (Continuous Linked Settlement) eliminates FX settlement risk
         by settling both legs of an FX transaction simultaneously.
@@ -1399,7 +1795,8 @@ class HybridSettlementGateway:
         }
         cls_ref = await self._cls.submit_cls_instruction(cls_payload)
         msg = await self._persist_rail_message(
-            instruction.id, SettlementRail.CLS, "CLS_DVP_MATCHED", cls_payload, cls_ref
+            instruction.id, SettlementRail.CLS,
+            "CLS_DVP_MATCHED", cls_payload, cls_ref, ctx,
         )
         self._log.info("CLS instruction submitted for %s — ref=%s", instruction.id, cls_ref)
         return [msg]
@@ -1411,21 +1808,29 @@ class HybridSettlementGateway:
         message_type: str,
         payload: dict,
         rail_reference: str,
+        ctx: AuditContext = None,
     ) -> HybridRailMessage:
         msg_id    = _new_id()
         submitted = _now()
+        audit_args = ctx.as_sql_args() if ctx else (None,None,None,None)
         await self._db.execute(
             """
             INSERT INTO hybrid_rail_messages
-              (id, instruction_id, rail, message_type, payload, rail_reference)
-            VALUES ($1,$2,$3,$4,$5,$6)
+              (id, instruction_id, rail, message_type, payload,
+               rail_reference,
+               request_id, trace_id, actor, actor_role)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
             """,
             msg_id, instruction_id, rail, message_type,
-            json.dumps(payload), rail_reference,
+            json.dumps(payload), rail_reference, *audit_args,
         )
         await self._db.execute(
-            "INSERT INTO hybrid_rail_message_events (id, message_id, status) VALUES ($1,$2,$3)",
+            "INSERT INTO hybrid_rail_message_events "
+            "(id, message_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
             _new_id(), msg_id, HybridRailStatus.SUBMITTED,
+            *audit_args,
         )
         return HybridRailMessage(
             id=msg_id, instruction_id=instruction_id, rail=rail,
@@ -1443,7 +1848,9 @@ class HybridSettlementGateway:
         )
         for msg in msgs:
             await self._db.execute(
-                "INSERT INTO hybrid_rail_message_events (id, message_id, status) VALUES ($1,$2,$3)",
+                "INSERT INTO hybrid_rail_message_events "
+                "(id, message_id, status) "
+                "VALUES ($1,$2,$3)",
                 _new_id(), msg["id"], HybridRailStatus.CONFIRMED,
             )
         self._log.info("Rail message confirmed — ref=%s at=%s", rail_reference, now)
@@ -1474,22 +1881,172 @@ class DVPReconciliationEngine:
     JPMorgan Onyx's real-time position verification.
     """
  
-    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter):
+    def __init__(self, db: AbstractDB, chain: AbstractChainAdapter,
+                 rbac: RBACChecker = None):
         self._db    = db
         self._chain = chain
+        self._rbac  = rbac
         self._log   = logging.getLogger("dvp.reconciliation")
  
+    async def _replay_and_verify_balances(
+        self,
+        instruction: SettlementInstruction,
+    ) -> list[dict]:
+        """
+        Replays raw ledger entries in Python and compares
+        against derived VIEWs. Returns list of mismatch dicts
+        (empty = OK).
+        """
+        mismatches = []
+
+        # Replay security ledger for buyer
+        sec_rows = await self._db.fetch(
+            "SELECT pool, amount FROM security_ledger "
+            "WHERE entity_id = $1 AND isin = $2",
+            instruction.buyer_entity_id, instruction.isin,
+        )
+        replayed_avail = sum(
+            Decimal(str(r["amount"])) for r in sec_rows
+            if r["pool"] == "AVAILABLE"
+        )
+        replayed_locked = sum(
+            Decimal(str(r["amount"])) for r in sec_rows
+            if r["pool"] == "LOCKED"
+        )
+
+        view_row = await self._db.fetchrow(
+            "SELECT available_quantity, locked_quantity "
+            "FROM custody_balances "
+            "WHERE entity_id = $1 AND isin = $2",
+            instruction.buyer_entity_id, instruction.isin,
+        )
+        if view_row:
+            view_avail = Decimal(
+                str(view_row["available_quantity"])
+            )
+            view_locked = Decimal(
+                str(view_row["locked_quantity"])
+            )
+            if replayed_avail != view_avail:
+                mismatches.append({
+                    "type": "SECURITY_REPLAY_MISMATCH",
+                    "entity": instruction.buyer_entity_id,
+                    "pool": "AVAILABLE",
+                    "replayed": str(replayed_avail),
+                    "view": str(view_avail),
+                })
+            if replayed_locked != view_locked:
+                mismatches.append({
+                    "type": "SECURITY_REPLAY_MISMATCH",
+                    "entity": instruction.buyer_entity_id,
+                    "pool": "LOCKED",
+                    "replayed": str(replayed_locked),
+                    "view": str(view_locked),
+                })
+
+        # Replay cash ledger for seller
+        cash_rows = await self._db.fetch(
+            "SELECT pool, amount FROM cash_ledger "
+            "WHERE entity_id = $1 AND currency = $2",
+            instruction.seller_entity_id,
+            instruction.currency,
+        )
+        replayed_cash_avail = sum(
+            Decimal(str(r["amount"])) for r in cash_rows
+            if r["pool"] == "AVAILABLE"
+        )
+        replayed_cash_locked = sum(
+            Decimal(str(r["amount"])) for r in cash_rows
+            if r["pool"] == "LOCKED"
+        )
+
+        cash_view = await self._db.fetchrow(
+            "SELECT available_balance, locked_balance "
+            "FROM cash_balances "
+            "WHERE entity_id = $1 AND currency = $2",
+            instruction.seller_entity_id,
+            instruction.currency,
+        )
+        if cash_view:
+            cv_avail = Decimal(
+                str(cash_view["available_balance"])
+            )
+            cv_locked = Decimal(
+                str(cash_view["locked_balance"])
+            )
+            if replayed_cash_avail != cv_avail:
+                mismatches.append({
+                    "type": "CASH_REPLAY_MISMATCH",
+                    "entity": instruction.seller_entity_id,
+                    "pool": "AVAILABLE",
+                    "replayed": str(replayed_cash_avail),
+                    "view": str(cv_avail),
+                })
+            if replayed_cash_locked != cv_locked:
+                mismatches.append({
+                    "type": "CASH_REPLAY_MISMATCH",
+                    "entity": instruction.seller_entity_id,
+                    "pool": "LOCKED",
+                    "replayed": str(replayed_cash_locked),
+                    "view": str(cv_locked),
+                })
+
+        # Double-entry invariant: SUM of all ledger entries
+        # per instruction should net to zero
+        sec_net = await self._db.fetchrow(
+            "SELECT COALESCE(SUM(amount), 0) AS net "
+            "FROM security_ledger "
+            "WHERE instruction_id = $1",
+            instruction.id,
+        )
+        if sec_net and Decimal(str(sec_net["net"])) != 0:
+            mismatches.append({
+                "type": "DOUBLE_ENTRY_VIOLATION",
+                "ledger": "security",
+                "instruction_id": instruction.id,
+                "net": str(sec_net["net"]),
+            })
+
+        cash_net = await self._db.fetchrow(
+            "SELECT COALESCE(SUM(amount), 0) AS net "
+            "FROM cash_ledger WHERE instruction_id = $1",
+            instruction.id,
+        )
+        if cash_net and Decimal(str(cash_net["net"])) != 0:
+            mismatches.append({
+                "type": "DOUBLE_ENTRY_VIOLATION",
+                "ledger": "cash",
+                "instruction_id": instruction.id,
+                "net": str(cash_net["net"]),
+            })
+
+        return mismatches
+
+    @require_permission("reconciliation.run")
     async def reconcile_instruction(
         self,
         instruction: SettlementInstruction,
         security_token_address: str,
         cash_token_address: str,
+        ctx: AuditContext = None,
     ) -> ReconciliationReport:
         """
         Full 4-source reconciliation for a single settled instruction.
         """
         mismatches = []
         report_id  = _new_id()
+
+        # ── 0. Ledger replay verification ──
+        replay_mismatches = (
+            await self._replay_and_verify_balances(instruction)
+        )
+        mismatches.extend(replay_mismatches)
+        if replay_mismatches:
+            self._log.critical(
+                "Ledger replay detected %d mismatch(es) "
+                "for instruction %s",
+                len(replay_mismatches), instruction.id,
+            )
  
         # ── 1. On-chain balance check ──
         buyer_sec_bal = await self._chain.get_balance(
@@ -1583,34 +2140,50 @@ class DVPReconciliationEngine:
             await self._db.execute(
                 """
                 INSERT INTO reconciliation_reports
-                  (id, instruction_id, result, security_leg_verified, cash_leg_verified,
+                  (id, instruction_id, result,
+                   security_leg_verified, cash_leg_verified,
                    onchain_supply_matched, rail_confirmation_matched,
-                   mismatches, reconciled_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                   mismatches,
+                   request_id, trace_id, actor, actor_role,
+                   reconciled_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                 """,
                 report.id, instruction.id, result,
-                sec_matched, cash_matched, onchain_matched, rail_matched,
-                json.dumps(mismatches), report.reconciled_at,
+                sec_matched, cash_matched,
+                onchain_matched, rail_matched,
+                json.dumps(mismatches),
+                *ctx.as_sql_args(),
+                report.reconciled_at,
             )
  
             if result == ReconciliationResult.MISMATCH:
                 await self._db.execute(
-                    "INSERT INTO dvp_instruction_events (id, instruction_id, reconciliation_status) VALUES ($1,$2,$3)",
+                    "INSERT INTO dvp_instruction_events "
+                    "(id, instruction_id, reconciliation_status, "
+                    "request_id, trace_id, actor, actor_role) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     _new_id(), instruction.id, "SUSPENDED",
+                    *ctx.as_sql_args(),
                 )
+                recon_payload = {
+                    "instruction_id": instruction.id,
+                    "report_id": report.id,
+                    "mismatches": mismatches,
+                    "alert": "CRITICAL — SETTLEMENT SUSPENDED",
+                    **ctx.as_dict(),
+                }
                 await self._db.execute(
                     """
-                    INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at)
-                    VALUES ($1,$2,$3,$4,$5)
+                    INSERT INTO outbox_events
+                        (id, aggregate_id, event_type, payload,
+                         request_id, trace_id, actor, actor_role,
+                         created_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                     """,
-                    _new_id(), instruction.id, "dvp.reconciliation_mismatch",
-                    json.dumps({
-                        "instruction_id": instruction.id,
-                        "report_id": report.id,
-                        "mismatches": mismatches,
-                        "alert": "CRITICAL — SETTLEMENT SUSPENDED",
-                    }),
-                    _now(),
+                    _new_id(), instruction.id,
+                    "dvp.reconciliation_mismatch",
+                    json.dumps(recon_payload),
+                    *ctx.as_sql_args(), _now(),
                 )
                 self._log.critical(
                     "RECONCILIATION MISMATCH — instruction=%s mismatches=%d SETTLEMENT SUSPENDED",
@@ -1641,13 +2214,13 @@ class DVPSettlementService:
     Settlement Flow:
     ────────────────
     1.  Idempotency check (prevent duplicate instructions)
-    2.  Persist instruction (INITIATED)
+    2.  Persist instruction (PENDING)
     3.  Compliance screening (OFAC/AML) — outside DB tx
     4.  Lock both settlement legs (LEGS_LOCKED)
     5.  Fund escrow accounts on-chain (ESCROW_FUNDED)
     6.  Submit hybrid rail messages (SWIFT/FedWire/CLS)
-    7.  Await multi-sig quorum (MULTISIG_PENDING → MULTISIG_APPROVED)
-    8.  Execute atomic swap (ATOMIC_SWAP → SETTLED)
+    7.  Await multi-sig quorum (MULTISIG_PENDING → APPROVED)
+    8.  Execute atomic swap (SIGNED → BROADCASTED → CONFIRMED)
     9.  Post-settlement reconciliation
  
     Unwind Flow (failure / rejection):
@@ -1672,11 +2245,11 @@ class DVPSettlementService:
         atomic_swap: AtomicSwapExecutor,
         hybrid_gateway: HybridSettlementGateway,
         reconciliation_engine: DVPReconciliationEngine,
-        # Addresses of escrow smart contracts on the DLT
         security_escrow_address: str,
         cash_escrow_address: str,
         security_token_address: str,
         cash_token_address: str,
+        rbac: RBACChecker = None,
     ):
         self._db               = db
         self._compliance       = compliance_service
@@ -1690,8 +2263,10 @@ class DVPSettlementService:
         self._cash_escrow_addr = cash_escrow_address
         self._sec_token_addr   = security_token_address
         self._cash_token_addr  = cash_token_address
+        self._rbac             = rbac
         self._log              = logging.getLogger("dvp.orchestrator")
  
+    @require_permission("settlement.initiate")
     async def initiate_settlement(
         self,
         trade_reference: str,
@@ -1711,10 +2286,11 @@ class DVPSettlementService:
         seller_jurisdiction: str,
         buyer_jurisdiction: str,
         idempotency_key: str,
+        ctx: AuditContext = None,
     ) -> SettlementInstruction:
         """
         Entry point for a new DVP settlement instruction.
-        Returns immediately with instruction in INITIATED status.
+        Returns immediately with instruction in PENDING status.
         Subsequent steps run asynchronously.
         """
         # ── Step 1: Idempotency guard ──
@@ -1761,77 +2337,121 @@ class DVPSettlementService:
             await self._db.execute(
                 """
                 INSERT INTO dvp_instructions
-                  (id, trade_reference, isin, security_type, quantity, price_per_unit,
-                   settlement_amount, currency, seller_entity_id, buyer_entity_id,
-                   seller_wallet, buyer_wallet, seller_custodian, buyer_custodian,
+                  (id, trade_reference, isin, security_type,
+                   quantity, price_per_unit,
+                   settlement_amount, currency,
+                   seller_entity_id, buyer_entity_id,
+                   seller_wallet, buyer_wallet,
+                   seller_custodian, buyer_custodian,
                    settlement_rail, intended_settlement_date,
-                   idempotency_key, created_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                   idempotency_key,
+                   request_id, trace_id, actor, actor_role,
+                   created_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                        $13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
                 """,
-                instruction_id, trade_reference, isin, security_type,
-                quantity, price_per_unit, settlement_amount, currency,
+                instruction_id, trade_reference, isin,
+                security_type,
+                quantity, price_per_unit,
+                settlement_amount, currency,
                 seller_entity_id, buyer_entity_id,
                 seller_wallet, buyer_wallet,
                 seller_custodian, buyer_custodian,
                 settlement_rail, intended_settlement_date,
-                idempotency_key, now,
-            )
-            await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
-                _new_id(), instruction_id, SettlementStatus.INITIATED,
-            )
-            await self._db.execute(
-                "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
-                _new_id(), instruction_id, "dvp.initiated",
-                json.dumps({
-                    "instruction_id": instruction_id,
-                    "trade_reference": trade_reference,
-                    "isin": isin,
-                    "quantity": str(quantity),
-                    "settlement_amount": str(settlement_amount),
-                    "currency": currency,
-                    "seller": seller_entity_id,
-                    "buyer": buyer_entity_id,
-                    "rail": settlement_rail,
-                    "initiated_at": now,
-                }),
+                idempotency_key,
+                *ctx.as_sql_args(),
                 now,
             )
+            await self._db.execute(
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                _new_id(), instruction_id,
+                SettlementStatus.PENDING,
+                *ctx.as_sql_args(),
+            )
+            init_payload = {
+                "instruction_id": instruction_id,
+                "trade_reference": trade_reference,
+                "isin": isin,
+                "quantity": str(quantity),
+                "settlement_amount": str(settlement_amount),
+                "currency": currency,
+                "seller": seller_entity_id,
+                "buyer": buyer_entity_id,
+                "rail": settlement_rail,
+                "initiated_at": now,
+                **ctx.as_dict(),
+            }
+            await self._db.execute(
+                "INSERT INTO outbox_events "
+                "(id, aggregate_id, event_type, payload, "
+                "request_id, trace_id, actor, actor_role, "
+                "created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                _new_id(), instruction_id, "dvp.initiated",
+                json.dumps(init_payload),
+                *ctx.as_sql_args(), now,
+            )
  
+        await write_audit_log(
+            self._db, ctx, "settlement.initiate",
+            f"instruction/{instruction_id}",
+            {"trade_reference": trade_reference, "isin": isin},
+        )
         self._log.info(
-            "DVP instruction INITIATED — id=%s ref=%s isin=%s qty=%s",
+            "DVP instruction PENDING — id=%s ref=%s isin=%s qty=%s",
             instruction_id, trade_reference, isin, quantity
         )
  
         # ── Step 3: Compliance screening (outside DB tx) ──
         await self._db.execute(
-            "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
-            _new_id(), instruction_id, SettlementStatus.COMPLIANCE_CHECK,
+            "INSERT INTO dvp_instruction_events "
+            "(id, instruction_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            _new_id(), instruction_id,
+            SettlementStatus.COMPLIANCE_CHECK,
+            *ctx.as_sql_args(),
         )
         compliance = await self._compliance.screen_instruction(
-            instruction, seller_jurisdiction, buyer_jurisdiction
+            instruction, seller_jurisdiction, buyer_jurisdiction,
+            ctx=ctx,
         )
         if not compliance.is_cleared:
-            await self._reject_instruction(instruction_id, compliance.reason)
+            await self._reject_instruction(
+                instruction_id, compliance.reason, ctx
+            )
             raise ComplianceRejectionError(compliance.reason)
  
         # ── Step 4: Lock both legs ──
-        await self._legs.create_and_lock_legs(instruction)
+        await self._legs.create_and_lock_legs(
+            instruction, ctx=ctx
+        )
  
         # ── Step 5: Fund escrow accounts ──
         await self._escrow.fund_escrow_accounts(
             instruction,
             self._sec_escrow_addr, self._cash_escrow_addr,
             self._sec_token_addr, self._cash_token_addr,
+            ctx=ctx,
         )
  
         # ── Step 6: Submit hybrid rail messages ──
-        await self._hybrid.submit_settlement_messages(instruction)
+        await self._hybrid.submit_settlement_messages(
+            instruction, ctx=ctx
+        )
  
         # ── Multi-sig pending ──
         await self._db.execute(
-            "INSERT INTO dvp_instruction_events (id, instruction_id, status) VALUES ($1,$2,$3)",
-            _new_id(), instruction_id, SettlementStatus.MULTISIG_PENDING,
+            "INSERT INTO dvp_instruction_events "
+            "(id, instruction_id, status, "
+            "request_id, trace_id, actor, actor_role) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+            _new_id(), instruction_id,
+            SettlementStatus.MULTISIG_PENDING,
+            *ctx.as_sql_args(),
         )
  
         self._log.info(
@@ -1840,7 +2460,11 @@ class DVPSettlementService:
         )
         return instruction
  
-    async def finalize_settlement(self, instruction_id: str) -> str:
+    @require_permission("settlement.finalize")
+    async def finalize_settlement(
+        self, instruction_id: str,
+        ctx: AuditContext = None,
+    ) -> str:
         """
         Called after multi-sig quorum is confirmed.
         Executes atomic swap and runs post-settlement reconciliation.
@@ -1852,7 +2476,7 @@ class DVPSettlementService:
         )
         if not row:
             raise DVPSettlementError(f"Instruction {instruction_id} not found")
-        if row["status"] != SettlementStatus.MULTISIG_APPROVED:
+        if row["status"] != SettlementStatus.APPROVED:
             raise DVPSettlementError(
                 f"Cannot finalize — instruction {instruction_id} is in status {row['status']}"
             )
@@ -1861,27 +2485,48 @@ class DVPSettlementService:
  
         # ── Atomic swap ──
         swap_tx_hash = await self._swap.execute(
-            instruction, self._sec_escrow_addr, self._cash_escrow_addr
+            instruction, self._sec_escrow_addr,
+            self._cash_escrow_addr, ctx=ctx,
         )
  
         # ── Post-settlement reconciliation ──
         await self._reconciliation.reconcile_instruction(
-            instruction, self._sec_token_addr, self._cash_token_addr
+            instruction, self._sec_token_addr,
+            self._cash_token_addr, ctx=ctx,
         )
  
         return swap_tx_hash
  
-    async def _reject_instruction(self, instruction_id: str, reason: str):
+    async def _reject_instruction(
+        self, instruction_id: str, reason: str,
+        ctx: AuditContext = None,
+    ):
         now = _now()
         async with self._db.transaction():
             await self._db.execute(
-                "INSERT INTO dvp_instruction_events (id, instruction_id, status, failure_reason) VALUES ($1,$2,$3,$4)",
-                _new_id(), instruction_id, SettlementStatus.REVERSED, reason,
+                "INSERT INTO dvp_instruction_events "
+                "(id, instruction_id, status, failure_reason, "
+                "request_id, trace_id, actor, actor_role) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                _new_id(), instruction_id,
+                SettlementStatus.REVERSED, reason,
+                *(ctx.as_sql_args() if ctx else (None,)*4),
             )
+            reject_payload = {
+                "instruction_id": instruction_id,
+                "reason": reason, "rejected_at": now,
+            }
+            if ctx:
+                reject_payload.update(ctx.as_dict())
             await self._db.execute(
-                "INSERT INTO outbox_events (id, aggregate_id, event_type, payload, created_at) VALUES ($1,$2,$3,$4,$5)",
+                "INSERT INTO outbox_events "
+                "(id, aggregate_id, event_type, payload, "
+                "request_id, trace_id, actor, actor_role, "
+                "created_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
                 _new_id(), instruction_id, "dvp.rejected",
-                json.dumps({"instruction_id": instruction_id, "reason": reason, "rejected_at": now}),
+                json.dumps(reject_payload),
+                *(ctx.as_sql_args() if ctx else (None,)*4),
                 now,
             )
  
@@ -2339,6 +2984,107 @@ async def seed_sandbox_data(db: AbstractDB) -> None:
                 lei, currency, amount,
             )
 
+    # -- D. Seed RBAC tables (idempotent) --
+    existing_roles = await db.fetchrow(
+        "SELECT 1 FROM rbac_roles WHERE role_name = 'SYSTEM'"
+    )
+    if not existing_roles:
+        logger.info("Seeding RBAC roles and permissions")
+        roles = [
+            ("00000000-0000-0000-0000-000000000001", "ADMIN",
+             "Full system access"),
+            ("00000000-0000-0000-0000-000000000002", "ORIGINATOR",
+             "Can initiate settlement instructions"),
+            ("00000000-0000-0000-0000-000000000003", "CUSTODIAN",
+             "Can vote on multi-sig, fund/release escrow"),
+            ("00000000-0000-0000-0000-000000000004",
+             "COMPLIANCE_OFFICER",
+             "Can run compliance screenings"),
+            ("00000000-0000-0000-0000-000000000005", "SYSTEM",
+             "Internal system operations"),
+            ("00000000-0000-0000-0000-000000000006", "SIGNER",
+             "Can cast multi-sig votes"),
+        ]
+        for rid, rname, desc in roles:
+            await db.execute(
+                "INSERT INTO rbac_roles (id, role_name, description)"
+                " VALUES ($1,$2,$3)",
+                rid, rname, desc,
+            )
+
+        perms = [
+            ("00000000-0000-0000-0000-000000000001", "*"),
+            ("00000000-0000-0000-0000-000000000002",
+             "settlement.initiate"),
+            ("00000000-0000-0000-0000-000000000003",
+             "multisig.vote"),
+            ("00000000-0000-0000-0000-000000000003",
+             "escrow.fund"),
+            ("00000000-0000-0000-0000-000000000003",
+             "escrow.release"),
+            ("00000000-0000-0000-0000-000000000004",
+             "compliance.screen"),
+            ("00000000-0000-0000-0000-000000000005",
+             "settlement.initiate"),
+            ("00000000-0000-0000-0000-000000000005",
+             "settlement.finalize"),
+            ("00000000-0000-0000-0000-000000000005",
+             "compliance.screen"),
+            ("00000000-0000-0000-0000-000000000005",
+             "escrow.fund"),
+            ("00000000-0000-0000-0000-000000000005",
+             "escrow.release"),
+            ("00000000-0000-0000-0000-000000000005",
+             "multisig.vote"),
+            ("00000000-0000-0000-0000-000000000005",
+             "swap.execute"),
+            ("00000000-0000-0000-0000-000000000005",
+             "rail.submit"),
+            ("00000000-0000-0000-0000-000000000005",
+             "reconciliation.run"),
+            ("00000000-0000-0000-0000-000000000006",
+             "multisig.vote"),
+        ]
+        for role_id, perm in perms:
+            await db.execute(
+                "INSERT INTO rbac_role_permissions "
+                "(role_id, permission) VALUES ($1,$2)",
+                role_id, perm,
+            )
+
+        actors = [
+            ("SYSTEM/seed",
+             "00000000-0000-0000-0000-000000000005", "BOOTSTRAP"),
+            ("SYSTEM/sandbox",
+             "00000000-0000-0000-0000-000000000005", "BOOTSTRAP"),
+            ("SYSTEM/orchestrator",
+             "00000000-0000-0000-0000-000000000005", "BOOTSTRAP"),
+            (seller_lei,
+             "00000000-0000-0000-0000-000000000002", "BOOTSTRAP"),
+            (buyer_lei,
+             "00000000-0000-0000-0000-000000000002", "BOOTSTRAP"),
+            ("IRVTUS3N",
+             "00000000-0000-0000-0000-000000000003", "BOOTSTRAP"),
+            ("SBOSUS33",
+             "00000000-0000-0000-0000-000000000003", "BOOTSTRAP"),
+            ("DTCCUS3N",
+             "00000000-0000-0000-0000-000000000003", "BOOTSTRAP"),
+            ("IRVTUS3N",
+             "00000000-0000-0000-0000-000000000006", "BOOTSTRAP"),
+            ("SBOSUS33",
+             "00000000-0000-0000-0000-000000000006", "BOOTSTRAP"),
+            ("DTCCUS3N",
+             "00000000-0000-0000-0000-000000000006", "BOOTSTRAP"),
+            ("COMPLIANCE/sandbox",
+             "00000000-0000-0000-0000-000000000004", "BOOTSTRAP"),
+        ]
+        for actor, role_id, granted_by in actors:
+            await db.execute(
+                "INSERT INTO rbac_actor_roles "
+                "(actor, role_id, granted_by) VALUES ($1,$2,$3)",
+                actor, role_id, granted_by,
+            )
+
     logger.info("Sandbox seed data ready")
 
 
@@ -2380,23 +3126,30 @@ async def sandbox_demo():
     await seed_sandbox_data(db)
 
     # ── Wire services (real DB + sandbox external stubs) ──────────────────
+    # ── RBAC checker (shared across all services) ──
+    rbac = RBACChecker(db)
+
     compliance_svc = ComplianceScreeningService(
-        db, SandboxComplianceProvider()
+        db, SandboxComplianceProvider(), rbac,
     )
     chain = SandboxChainAdapter()
-    leg_svc = SettlementLegService(db, chain)
-    escrow_svc = EscrowService(db, chain)
+    leg_svc = SettlementLegService(db, chain, rbac)
+    escrow_svc = EscrowService(db, chain, rbac)
     hsm = SandboxHSMSigningService()
     signing_queue = SandboxSigningQueue()
 
     required_custodians = ["IRVTUS3N", "SBOSUS33", "DTCCUS3N"]
-    multisig_svc = MultiSigApprovalService(db, hsm, required_custodians)
-    swap_executor = AtomicSwapExecutor(db, chain, signing_queue)
+    multisig_svc = MultiSigApprovalService(
+        db, hsm, required_custodians, rbac,
+    )
+    swap_executor = AtomicSwapExecutor(
+        db, chain, signing_queue, rbac,
+    )
     hybrid_gw = HybridSettlementGateway(
         db, SandboxSWIFTGateway(), SandboxFedWireGateway(),
-        SandboxCLSGateway(),
+        SandboxCLSGateway(), rbac,
     )
-    recon_engine = DVPReconciliationEngine(db, chain)
+    recon_engine = DVPReconciliationEngine(db, chain, rbac)
 
     dvp_svc = DVPSettlementService(
         db=db,
@@ -2411,8 +3164,15 @@ async def sandbox_demo():
         cash_escrow_address="0xCASH_ESCROW_CONTRACT",
         security_token_address="0xAAPL_TOKEN_CONTRACT",
         cash_token_address="0xUSD_TOKEN_CONTRACT",
+        rbac=rbac,
     )
-    logger.info("All services wired (real DB + sandbox external stubs)")
+    logger.info("All services wired (real DB + RBAC + sandbox stubs)")
+
+    # ── Audit contexts ──
+    trace_id = str(uuid.uuid4())
+    system_ctx = AuditContext.for_actor(
+        "SYSTEM/sandbox", "SYSTEM", trace_id,
+    )
 
     # ── Execute full settlement flow ──────────────────────────────────────────
     try:
@@ -2435,29 +3195,42 @@ async def sandbox_demo():
             seller_jurisdiction="US",
             buyer_jurisdiction="US",
             idempotency_key=str(uuid.uuid4()),
+            ctx=system_ctx,
         )
         logger.info(
             "Instruction %s at MULTISIG_PENDING", instruction.id
         )
 
         # Step 7: Cast multi-sig votes (2-of-3 quorum)
+        # Per-custodian audit contexts (different actors)
+        bnym_ctx = AuditContext.for_actor(
+            "IRVTUS3N", "CUSTODIAN", trace_id,
+        )
+        sst_ctx = AuditContext.for_actor(
+            "SBOSUS33", "CUSTODIAN", trace_id,
+        )
+
         await multisig_svc.cast_vote(
             instruction.id, "IRVTUS3N",
             "HSM-BNYM-KEY-001", MultiSigVote.APPROVE,
+            ctx=bnym_ctx,
         )
         await multisig_svc.cast_vote(
             instruction.id, "SBOSUS33",
             "HSM-SST-KEY-001", MultiSigVote.APPROVE,
+            ctx=sst_ctx,
         )
 
         if await multisig_svc.check_quorum(instruction.id):
-            await multisig_svc.finalize_quorum(instruction.id)
+            await multisig_svc.finalize_quorum(
+                instruction.id, ctx=system_ctx,
+            )
             logger.info("Multi-sig quorum reached")
 
         # Steps 8-9: Atomic swap + reconciliation
         try:
             swap_tx = await dvp_svc.finalize_settlement(
-                instruction.id
+                instruction.id, ctx=system_ctx,
             )
             logger.info("Settlement COMPLETE — tx=%s", swap_tx)
         except ReconciliationHalt:

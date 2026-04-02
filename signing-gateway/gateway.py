@@ -14,14 +14,34 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 
 from aiohttp import ClientSession, web
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
+
+class StructuredFormatter(logging.Formatter):
+    """JSON log formatter with optional request_id/trace_id."""
+
+    def format(self, record):
+        entry = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "request_id"):
+            entry["request_id"] = record.request_id
+        if hasattr(record, "trace_id"):
+            entry["trace_id"] = record.trace_id
+        return json.dumps(entry)
+
+
+handler = logging.StreamHandler()
+handler.setFormatter(StructuredFormatter())
 logger = logging.getLogger("dvp.signing_gateway")
+logger.setLevel(logging.INFO)
+logger.addHandler(handler)
+logger.propagate = False
 
 PORT = int(os.getenv("PORT", "8000"))
 MPC_NODES = os.getenv("MPC_NODES", "").split(",")
@@ -36,6 +56,14 @@ async def handle_sign(request: web.Request) -> web.Response:
     Fans out to all MPC nodes, collects partial signatures,
     combines if threshold is met.
     """
+    request_id = request.headers.get(
+        "X-Request-ID", str(uuid.uuid4()),
+    )
+    trace_id = request.headers.get(
+        "X-Trace-ID", str(uuid.uuid4()),
+    )
+    extra = {"request_id": request_id, "trace_id": trace_id}
+
     body = await request.json()
     instruction_id = body.get("instruction_id", "unknown")
     payload = body.get("payload", {})
@@ -44,6 +72,7 @@ async def handle_sign(request: web.Request) -> web.Response:
         "Signing request for instruction %s — "
         "threshold=%d nodes=%d",
         instruction_id, THRESHOLD, len(MPC_NODES),
+        extra=extra,
     )
 
     partial_sigs = []
@@ -57,6 +86,7 @@ async def handle_sign(request: web.Request) -> web.Response:
             tasks.append(
                 _request_partial(
                     session, url, instruction_id, payload,
+                    request_id, trace_id,
                 )
             )
 
@@ -69,18 +99,22 @@ async def handle_sign(request: web.Request) -> web.Response:
             else:
                 logger.warning(
                     "MPC node error: %s", result,
+                    extra=extra,
                 )
 
     if len(partial_sigs) < THRESHOLD:
         logger.error(
             "Threshold not met — got %d/%d partials",
             len(partial_sigs), THRESHOLD,
+            extra=extra,
         )
         return web.json_response(
             {
                 "error": "threshold_not_met",
                 "received": len(partial_sigs),
                 "required": THRESHOLD,
+                "request_id": request_id,
+                "trace_id": trace_id,
             },
             status=503,
         )
@@ -91,6 +125,7 @@ async def handle_sign(request: web.Request) -> web.Response:
     logger.info(
         "Signing complete for %s — combined=%s",
         instruction_id, combined[:32],
+        extra=extra,
     )
 
     return web.json_response({
@@ -98,6 +133,8 @@ async def handle_sign(request: web.Request) -> web.Response:
         "signature": combined,
         "threshold": THRESHOLD,
         "partials_received": len(partial_sigs),
+        "request_id": request_id,
+        "trace_id": trace_id,
     })
 
 
@@ -106,12 +143,18 @@ async def _request_partial(
     url: str,
     instruction_id: str,
     payload: dict,
+    request_id: str,
+    trace_id: str,
 ) -> str:
     async with session.post(
         url,
         json={
             "instruction_id": instruction_id,
             "payload": payload,
+        },
+        headers={
+            "X-Request-ID": request_id,
+            "X-Trace-ID": trace_id,
         },
         timeout=5,
     ) as resp:
