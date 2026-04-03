@@ -1,4 +1,6 @@
-# 🏦 Institutional DVP Settlement & Clearing System (Python)
+# 🏦 Institutional DVP Settlement & Clearing System
+
+<img width="1536" height="1024" alt="2475ab09-16a4-4873-bf9a-dc78659625b4" src="https://github.com/user-attachments/assets/c190a6a8-4074-4f46-9db4-9f2424c9b3f9" />
 
 > ⚠️ **SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION**
 > This codebase is a reference implementation designed for learning, prototyping, and architectural exploration. It is **not audited, not legally reviewed, and must not be used to settle real securities, manage investor funds, or interface with real payment rails (SWIFT, FedWire, CLS).** See the [Production Warning](#-production-warning) section for full details.
